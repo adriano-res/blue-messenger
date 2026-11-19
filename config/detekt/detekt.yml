@@ -1,0 +1,75 @@
+build:
+  maxIssues: 0
+
+config:
+  validation: true
+  warningsAsErrors: true
+
+coroutines:
+  active: true
+  GlobalCoroutineUsage:
+    active: true
+
+exceptions:
+  active: true
+  TooGenericExceptionCaught:
+    active: true
+    excludes:
+      - '**/test/**'
+      - '**/androidTest/**'
+      - '**/commonTest/**'
+      - '**/jvmTest/**'
+      - '**/androidUnitTest/**'
+    exceptionNames:
+      - 'ArrayIndexOutOfBoundsException'
+      - 'Error'
+      - 'Exception'
+      - 'IllegalMonitorStateException'
+      - 'IndexOutOfBoundsException'
+      - 'NullPointerException'
+      - 'RuntimeException'
+      - 'Throwable'
+  SwallowedException:
+    active: true
+    ignoredExceptionTypes:
+      - 'InterruptedException'
+      - 'MalformedURLException'
+      - 'NumberFormatException'
+      - 'ParseException'
+    allowedExceptionNameRegex: '_|(ignore|expected).*'
+
+style:
+  active: true
+  MagicNumber:
+    active: true
+    excludes:
+      - '**/test/**'
+      - '**/androidTest/**'
+      - '**/commonTest/**'
+      - '**/jvmTest/**'
+      - '**/androidUnitTest/**'
+      - '**/*Test.kt'
+    ignoreNumbers:
+      - '0'
+      - '1'
+    ignoreHashCodeFunction: true
+    ignorePropertyDeclaration: false
+    ignoreLocalVariableDeclaration: false
+    ignoreConstantDeclaration: true
+    ignoreCompanionObjectPropertyDeclaration: true
+    ignoreAnnotation: false
+    ignoreNamedArgument: false
+    ignoreEnums: false
+    ignoreRanges: false
+    ignoreExtensionFunctions: false
+  ForbiddenMethodCall:
+    active: true
+    methods:
+      - value: 'kotlin.io.print'
+        reason: 'Use structured logger instead of print in production code.'
+      - value: 'kotlin.io.println'
+        reason: 'Use structured logger instead of println in production code.'
+      - value: 'java.io.PrintStream.print'
+        reason: 'Use structured logger instead of System.out.print in production code.'
+      - value: 'java.io.PrintStream.println'
+        reason: 'Use structured logger instead of System.out.println in production code.'

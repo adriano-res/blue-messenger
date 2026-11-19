@@ -1,0 +1,17 @@
+.gradle/
+build/
+**/build/
+local.properties
+*.iml
+.idea/
+.DS_Store
+*.hprof
+captures/
+.kotlin/
+
+# Local
+.devcontainer/
+.agents/
+.gemini/
+.vscode/
+.local/

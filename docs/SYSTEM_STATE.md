@@ -1,0 +1,56 @@
+# Estado Atual do Sistema (System State) — Blue Messenger
+
+> **Documento Vivo**: Mantido automaticamente pelas skills do Kanban (`task-close`, `task-plan`).  
+> **Propósito**: Servir como memória executiva compacta para agentes e humanos, garantindo que o estado real do código seja consultado rapidamente sem consumir grandes volumes de tokens.
+
+---
+
+## 1. Status do Kanban de Desenvolvimento
+- **Cards Concluídos (`done/`)**:
+  - `001-setup-kmp-e-dominio-core.md` — Setup do Projeto KMP, Modelos de Domínio e Portas (`domain`)
+- **Card Atual em Andamento (`doing/`)**:
+  - Nenhum no momento.
+- **Card em Revisão (`review/`)**:
+  - Nenhum no momento.
+- **Cards Planejados no Pipeline (`prototype/`)**:
+  - `002-protocolo-framing-binario-e-pacotes.md` — Protocolo Binário Length-Prefixed, CRC32 e Pacotes (`protocol`)
+  - `003-motor-criptografico-e2ee-double-ratchet.md` — Motor Criptográfico E2EE: Noise XX, Double Ratchet, AEAD e Safety Numbers (`crypto`)
+  - `004-persistencia-local-sqldelight-repositorios.md` — Persistência Local Multiplataforma com SQLDelight (`data`)
+  - `005-casos-de-uso-sessao-mensagens-e-keepalive.md` — Casos de Uso de Domínio: Sessão E2EE, Mensagens, Fila Offline e Keep-Alive (`domain/usecase`)
+  - `006-adaptador-bluetooth-keystore-linux.md` — Adaptadores Linux Desktop (`jvmMain`): Transporte Bluetooth RFCOMM/BlueZ e KeyStore Seguro
+  - `007-adaptador-bluetooth-keystore-android.md` — Adaptadores Android (`androidMain`): Transporte Bluetooth RFCOMM, Permissões e Android KeyStore
+  - `008-apresentacao-viewmodels-e-ui-compartilhada.md` — Camada de Apresentação (`presentation`): ViewModels StateFlow e Telas Compose Multiplatform
+  - `009-entrypoints-androidapp-e-desktopapp.md` — Entrypoints de Plataforma (`androidApp` e `desktopApp`) e Integração Ponta a Ponta
+
+---
+
+## 2. Módulos e Bounded Contexts Ativos no Código
+
+| Módulo / Pacote | Papel Principal | Componentes Chave |
+| :--- | :--- | :--- |
+| **`domain`** (`com.bluemessenger.domain`) | Regras de negócio, modelos centrais, primitivas, enums e portas (100% puro `kotlin.*` e `kotlinx.coroutines.*`) | `model/` (`Peer`, `Conversation`, `Message`, `LocalIdentity`), `primitives/` (`BluetoothAddress`, `DomainId`, `Instant`, `PublicKey`), `enums/` (`SessionState`, `MessageStatus`, `MessageDirection`), `error/` (`DomainError`, `DomainException`), `concurrency/` (`CoroutineDispatchers`), `ports/transport/` (`BluetoothTransport`, `BluetoothScanner`, `TransportConstants`), `ports/crypto/` (`CryptoService`, `KeyStoreProvider`, `HandshakeStepResult`), `ports/repository/` (`MessageRepository`, `PeerRepository`, `IdentityRepository`) |
+| **`crypto`** (`com.bluemessenger.crypto`) | Motor criptográfico E2EE estilo Signal/WhatsApp (Double Ratchet, X25519, AEAD) | `ratchet/` (`DoubleRatchetSession`, `KdfChain`), `cipher/` (`ChaCha20Poly1305`), `handshake/` (`NoiseHandshake`), `safety/` (`SafetyNumbers`) |
+| **`protocol`** (`com.bluemessenger.protocol`) | Framing binário de rede, pacotes de handshake e integridade | `frame/` (`FrameEncoder`, `FrameDecoder`, `Checksum`), `packet/` (`Packet`, `HandshakePacket`, `EncryptedPayloadPacket`, `AckPacket`) |
+| **`data`** (`com.bluemessenger.data`) | Persistência local multiplataforma e mappers | `repository/` (`SqlDelightMessageRepository`), `mapper/` |
+| **`presentation`** (`com.bluemessenger.presentation`) | State holders, ViewModels e estados de UI multiplataforma | `chat/` (`ChatViewModel`, `ChatUiState`), `discovery/` (`DiscoveryViewModel`, `DiscoveryUiState`) |
+| **`platform-android`** (`com.bluemessenger.transport.android`) | Implementação do transporte Bluetooth usando APIs do Android SDK | `AndroidBluetoothTransport`, `AndroidBluetoothScanner`, `RfcommConnection` |
+| **`platform-linux`** (`com.bluemessenger.transport.linux`) | Implementação do transporte Bluetooth no Linux (BlueZ / Sockets nativos) | `LinuxBluezTransport`, `LinuxBluetoothScanner`, `RfcommSocket` |
+
+---
+
+## 3. Persistência e Armazenamento Local
+
+- **Engine de Banco de Dados**: SQLDelight (KMP) ou driver local SQLite.
+- **Tabelas / Esquema Previsto**:
+  - `peers`: `id` (TEXT PK), `name` (TEXT), `bluetooth_address` (TEXT UNIQUE), `last_seen_at` (INTEGER).
+  - `messages`: `id` (TEXT PK), `peer_id` (TEXT FK), `content` (TEXT), `direction` (TEXT: INCOMING/OUTGOING), `status` (TEXT: PENDING/SENT/DELIVERED/FAILED), `timestamp` (INTEGER).
+
+---
+
+## 4. Log de Decisões Importantes (ADR Compacto)
+
+- **ADR-001 (2026-11-17)**: Escolha de Kotlin Multiplatform (KMP) com foco em Linux e Android, garantindo que regras de negócio, serialização de pacotes de rede e persistência sejam 100% compartilhadas em `commonMain`.
+- **ADR-002 (2026-11-17)**: Transporte Bluetooth baseado em RFCOMM stream com framing delimitado por tamanho (Length-Prefixed Framing) e CRC para evitar leituras incompletas ou corrupção de mensagens entre SOs diferentes.
+- **ADR-003 (2026-11-17)**: Criptografia de Ponta a Ponta (E2EE) estilo Signal/WhatsApp adotando o algoritmo Double Ratchet com curvas elípticas Curve25519 (X25519 para troca de chaves Diffie-Hellman e Ed25519 para identidade) e ChaCha20-Poly1305 para cifragem autenticada (AEAD). Garante Forward Secrecy, Break-in Recovery e imunidade contra sniffing Bluetooth, com Safety Numbers (SAS) para validação contra MITM.
+- **ADR-004 (2026-11-18)**: Setup base KMP configurado com Android `minSdk = 31` (Android 12 alinhado com permissões granulares de Bluetooth sem GPS), `compileSdk = 34`, `targetSdk = 34`, `JDK 17` (`jvmTarget = 17`), Kotlin 2.1.21, Coroutines 1.10.2 e análise estática dupla via `ktlint` (12.2.0) e `detekt` (1.23.8) com proibições estritas de magic numbers, println e swallowed exceptions.
+- **ADR-005 (2026-11-19)**: Modelagem de domínio pura com zero dependências externas (`kotlin.*` e `kotlinx.coroutines.*` exclusivamente), adotando `@JvmInline value class` para primitivas de domínio e IDs temporais (RFC 9562 UUIDv7 puro e Instant temporal), e separação estrutural estrita: `model/` (entidades), `primitives/` (VOs imutáveis), `enums/` (máquinas de estado), `error/` (erros de domínio tipados), `concurrency/` (injeção de dispatchers) e `ports/` (`crypto`, `transport`, `repository`).
