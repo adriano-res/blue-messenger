@@ -36,7 +36,7 @@ Este documento define os padrões técnicos, convenções idiomáticas em **Kotl
 * **Proibição Estrita de Magic Numbers e Magic Literals:**
   * É expressamente proibido o uso de números mágicos literais (ex: `16`, `32`, `64`, `1024`, `5000`, `15000`) ou strings soltas (UUIDs de serviço, magic bytes de cabeçalho, constantes de canal de protocolo) espalhadas pelo código sem uma constante nomeada que explique semanticamente o seu propósito.
   * Todo valor numérico, tamanho de buffer, timeout de conexão/keep-alive, limite de retry, magic byte de frame ou parâmetro de algoritmo criptográfico deve ser declarado como `const val` em `UPPER_SNAKE_CASE`:
-    - **Constantes de Protocolo e Frames:** Em `com.bluemessenger.protocol.frame` (ex: `FRAME_MAGIC_BYTE = 0x42.toByte()`, `MAX_FRAME_PAYLOAD_BYTES = 1024`, `CRC32_CHECKSUM_SIZE_BYTES = 4`).
+    - **Constantes de Protocolo e Frames:** Em `com.bluemessenger.protocol.constants` (ex: `FRAME_MAGIC_BYTE = 0x42.toByte()`, `MAX_FRAME_PAYLOAD_BYTES = 1024`, `CRC32_CHECKSUM_SIZE_BYTES = 4`).
     - **Constantes Criptográficas:** Em `com.bluemessenger.crypto` (ex: `TAG_LENGTH_BYTES = 16`, `NONCE_LENGTH_BYTES = 12`, `SYMMETRIC_KEY_LENGTH_BYTES = 32`).
     - **Constantes de Temporização / Rede:** Em `com.bluemessenger.domain` ou transporte (ex: `KEEP_ALIVE_INTERVAL_MS = 15_000L`, `KEEP_ALIVE_TIMEOUT_MS = 5_000L`, `MAX_RECONNECT_ATTEMPTS = 5`).
   * **Exceção:** Os números `0` e `1` são aceitos sem constante apenas quando usados como índices ou contadores triviais (ex: `for (i in 0 until list.size)` ou `items.isEmpty()` / `list.size == 0`).

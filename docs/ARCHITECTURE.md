@@ -79,9 +79,11 @@ blue-messenger/
 │       │   │   ├── handshake/             # Acordo de chaves P2P (Noise XX / X25519)
 │       │   │   ├── key/                   # Gerenciamento de chaves (Identity Key, Ephemeral, PreKey)
 │       │   │   └── safety/                # Geração de Safety Numbers / SAS para verificação MITM
-│       │   ├── protocol/                  # Wire Protocol & Framing (Length-Prefixed + CRC32)
-│       │   │   ├── frame/                 # Codificação/decodificação de frames binários e CRC
-│       │   │   └── packet/                # Modelos de pacotes (Handshake, EncryptedPayload, Ack, Ping)
+│       │   ├── protocol/                  # Wire Protocol & Framing (PacketCodec, FrameEncoder, FrameDecoder)
+│       │   │   ├── model/                 # Modelos imutáveis de pacotes (Packet, Handshake, EncryptedPayload, Ack, KeepAlive)
+│       │   │   ├── util/                  # Utilitários de apoio binário (Crc32Checksum, BigEndianBytes)
+│       │   │   ├── constants/             # Constantes de protocolo e opcodes (FrameConstants, PacketConstants)
+│       │   │   └── error/                 # Erros tipados de framing e pacote (FrameError, PacketError)
 │       │   ├── data/
 │       │   │   ├── repository/            # Implementações de repositório (SQLDelight / InMemory)
 │       │   │   └── mapper/                # Mappers entre entidades de banco/rede e domínio
