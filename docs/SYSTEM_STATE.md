@@ -9,12 +9,12 @@
 - **Cards Concluídos (`done/`)**:
   - `001-setup-kmp-e-dominio-core.md` — Setup do Projeto KMP, Modelos de Domínio e Portas (`domain`)
   - `002-protocolo-framing-binario-e-pacotes.md` — Protocolo Binário Length-Prefixed, CRC32 e Pacotes (`protocol`)
+  - `003-motor-criptografico-e2ee-double-ratchet.md` — Motor Criptográfico E2EE: Noise XX, Double Ratchet, AEAD e Safety Numbers (`crypto`)
 - **Card Atual em Andamento (`doing/`)**:
   - Nenhum no momento.
 - **Card em Revisão (`review/`)**:
   - Nenhum no momento.
 - **Cards Planejados no Pipeline (`prototype/`)**:
-  - `003-motor-criptografico-e2ee-double-ratchet.md` — Motor Criptográfico E2EE: Noise XX, Double Ratchet, AEAD e Safety Numbers (`crypto`)
   - `004-persistencia-local-sqldelight-repositorios.md` — Persistência Local Multiplataforma com SQLDelight (`data`)
   - `005-casos-de-uso-sessao-mensagens-e-keepalive.md` — Casos de Uso de Domínio: Sessão E2EE, Mensagens, Fila Offline e Keep-Alive (`domain/usecase`)
   - `006-adaptador-bluetooth-keystore-linux.md` — Adaptadores Linux Desktop (`jvmMain`): Transporte Bluetooth RFCOMM/BlueZ e KeyStore Seguro
@@ -29,7 +29,7 @@
 | Módulo / Pacote | Papel Principal | Componentes Chave |
 | :--- | :--- | :--- |
 | **`domain`** (`com.bluemessenger.domain`) | Regras de negócio, modelos centrais, primitivas, enums e portas (100% puro `kotlin.*` e `kotlinx.coroutines.*`) | `model/` (`Peer`, `Conversation`, `Message`, `LocalIdentity`), `primitives/` (`BluetoothAddress`, `DomainId`, `Instant`, `PublicKey`), `enums/` (`SessionState`, `MessageStatus`, `MessageDirection`), `error/` (`DomainError`, `DomainException`), `concurrency/` (`CoroutineDispatchers`), `ports/transport/` (`BluetoothTransport`, `BluetoothScanner`, `TransportConstants`), `ports/crypto/` (`CryptoService`, `KeyStoreProvider`, `HandshakeStepResult`), `ports/repository/` (`MessageRepository`, `PeerRepository`, `IdentityRepository`) |
-| **`crypto`** (`com.bluemessenger.crypto`) | Motor criptográfico E2EE estilo Signal/WhatsApp (Double Ratchet, X25519, AEAD) | `ratchet/` (`DoubleRatchetSession`, `KdfChain`), `cipher/` (`ChaCha20Poly1305`), `handshake/` (`NoiseHandshake`), `safety/` (`SafetyNumbers`) |
+| **`crypto`** (`com.bluemessenger.crypto`) | Motor criptográfico E2EE estilo Signal/WhatsApp (Double Ratchet, X25519, AEAD) | `CryptoServiceImpl`, `CryptoHandshake`, `CryptoSession`, `CryptoCipher`, `CryptoSafetyNumber`, `CryptoEngine`, `model/` (`IdentityKeyPair`, `EphemeralKeyPair`, `RatchetHeader`), `constants/` (`CryptoConstants`), `util/` (`ByteArrayZeroizer`, `KdfChain`), + `jvmCommonMain/crypto/CryptoEngine` |
 | **`protocol`** (`com.bluemessenger.protocol`) | Framing binário de rede, pacotes de handshake e integridade | `PacketCodec`, `FrameEncoder`, `FrameDecoder`, `model/` (`Packet`, `HandshakePacket`, `EncryptedPayloadPacket`, `AckPacket`, `KeepAlivePacket`), `util/` (`Crc32Checksum`, `BigEndianBytes`), `constants/` (`FrameConstants`, `PacketConstants`), `error/` (`FrameError`, `PacketError`) |
 | **`data`** (`com.bluemessenger.data`) | Persistência local multiplataforma e mappers | `repository/` (`SqlDelightMessageRepository`), `mapper/` |
 | **`presentation`** (`com.bluemessenger.presentation`) | State holders, ViewModels e estados de UI multiplataforma | `chat/` (`ChatViewModel`, `ChatUiState`), `discovery/` (`DiscoveryViewModel`, `DiscoveryUiState`) |
@@ -56,3 +56,5 @@
 - **ADR-005 (2026-11-19)**: Modelagem de domínio pura com zero dependências externas (`kotlin.*` e `kotlinx.coroutines.*` exclusivamente), adotando `@JvmInline value class` para primitivas de domínio e IDs temporais (RFC 9562 UUIDv7 puro e Instant temporal), e separação estrutural estrita: `model/` (entidades), `primitives/` (VOs imutáveis), `enums/` (máquinas de estado), `error/` (erros de domínio tipados), `concurrency/` (injeção de dispatchers) e `ports/` (`crypto`, `transport`, `repository`).
 - **ADR-006 (2026-11-19)**: Serialização de pacotes de protocolo (`protocol/PacketCodec`) via Codec Binário Posicional Puro manual em Big-Endian (ordem de rede), eliminando dependências externas (como Protobuf ou CBOR) e minimizando o overhead de bytes sobre streams Bluetooth RFCOMM (RNF05), condicionado à cobertura obrigatória de testes automatizados exaustivos de round-trip e fail-fast contra corrupção/truncamento.
 - **ADR-007 (2026-11-19)**: Estrutura do módulo `protocol` com API principal na raiz (`PacketCodec`, `FrameEncoder`, `FrameDecoder`) e subpacotes por papel (`model/`, `util/`, `constants/`, `error/`); separação por ciclo de vida entre `PacketCodec`/`FrameEncoder` (`object` *stateless* e *thread-safe*) e `FrameDecoder` (`class` *stateful* por stream RFCOMM com `reset()` e validação fail-fast de `FRAME_MAGIC_BYTE = 0x42`, `MAX_FRAME_PAYLOAD_BYTES = 1024` e CRC32 IEEE 802.3).
+- **ADR-008 (2026-11-19)**: Adoção da Lightweight API do BouncyCastle (`org.bouncycastle:bcprov-jdk18on`) encapsulada em `internal expect/actual object CryptoEngine` no source set intermediário `jvmCommonMain` (`jvmMain` + `androidMain`), evitando conflitos JCA no Android 12 (`minSdk = 31`) e binários JNI, com derivação determinística de nonce (overhead de 56 B `<= MAX_CRYPTO_OVERHEAD_BYTES = 80`) e zeroização explícita (`ByteArrayZeroizer`).
+- **ADR-009 (2026-11-19)**: Padronização coesa do módulo `crypto` no mesmo formato de `protocol/` (`CryptoServiceImpl` com `Mutex` por peer, `CryptoHandshake` com construtor direto `isInitiator`, `CryptoSession`, `CryptoCipher`, `CryptoSafetyNumber`, ponte `CryptoEngine` e subpacotes `model/`, `constants/`, `util/`), sem pastas de arquivo único nem factories redundantes.

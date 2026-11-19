@@ -73,3 +73,14 @@ style:
         reason: 'Use structured logger instead of System.out.print in production code.'
       - value: 'java.io.PrintStream.println'
         reason: 'Use structured logger instead of System.out.println in production code.'
+
+complexity:
+  active: true
+  TooManyFunctions:
+    active: true
+    thresholdInFiles: 25
+    thresholdInClasses: 20
+    thresholdInInterfaces: 15
+    thresholdInObjects: 20
+    ignorePrivate: true
+    ignoreOverridden: true

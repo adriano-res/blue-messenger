@@ -16,8 +16,11 @@ import com.bluemessenger.domain.primitives.PublicKey
  */
 interface CryptoService {
     /**
-     * Initializes a new key-exchange session with [peerId], returning the initial outbound
-     * handshake message when [isInitiator] is `true` or an empty array when acting as responder.
+     * Starts a Noise XX handshake for [peerId] right after the transport connection opens.
+     *
+     * - Initiator (`isInitiator = true`): returns message 1 bytes to send immediately.
+     * - Responder (`isInitiator = false`): registers local handshake state and returns an empty array;
+     *   must be called before feeding inbound handshake payloads to [processHandshakeStep].
      */
     suspend fun initializeHandshake(
         peerId: PeerId,
@@ -25,7 +28,11 @@ interface CryptoService {
     ): Result<ByteArray>
 
     /**
-     * Processes an inbound handshake message for [peerId] and advances the Noise XX state machine.
+     * Advances an initialized handshake for [peerId] with an inbound [incomingPayload].
+     *
+     * Call after [initializeHandshake] for each incoming handshake packet, sending
+     * [HandshakeStepResult.copyResponsePayload] whenever non-null until [HandshakeStepResult.isComplete]
+     * is `true`. Fails with `InvalidStateTransitionError` if [initializeHandshake] was not called first.
      */
     suspend fun processHandshakeStep(
         peerId: PeerId,

@@ -73,12 +73,10 @@ blue-messenger/
 │       │   │   │   ├── transport/         # Portas de Bluetooth e constantes (BluetoothTransport, BluetoothScanner, TransportConstants)
 │       │   │   │   └── repository/        # Interfaces de repositório (MessageRepository, PeerRepository, IdentityRepository)
 │       │   │   └── usecase/               # Casos de uso de negócio
-│       │   ├── crypto/                    # Motor Criptográfico Concreto (Double Ratchet, X25519, ChaChaPoly)
-│       │   │   ├── ratchet/               # Double Ratchet (DH Ratchet + Symmetric KDF Chain)
-│       │   │   ├── cipher/                # Cifras autenticadas AEAD (ChaCha20-Poly1305 / AES-GCM)
-│       │   │   ├── handshake/             # Acordo de chaves P2P (Noise XX / X25519)
-│       │   │   ├── key/                   # Gerenciamento de chaves (Identity Key, Ephemeral, PreKey)
-│       │   │   └── safety/                # Geração de Safety Numbers / SAS para verificação MITM
+│       │   ├── crypto/                    # Motor Criptográfico Concreto (DefaultCryptoService, NoiseXxHandshake, DoubleRatchetSession, ChaCha20Poly1305Cipher, SafetyNumberGenerator)
+│       │   │   ├── model/                 # Modelos criptográficos (IdentityKeyPair, EphemeralKeyPair, RatchetHeader)
+│       │   │   ├── constants/             # Constantes criptográficas (CryptoConstants)
+│       │   │   └── util/                  # Utilitários criptográficos (ByteArrayZeroizer, KdfChain, expect CryptoPrimitives)
 │       │   ├── protocol/                  # Wire Protocol & Framing (PacketCodec, FrameEncoder, FrameDecoder)
 │       │   │   ├── model/                 # Modelos imutáveis de pacotes (Packet, Handshake, EncryptedPayload, Ack, KeepAlive)
 │       │   │   ├── util/                  # Utilitários de apoio binário (Crc32Checksum, BigEndianBytes)
@@ -92,12 +90,17 @@ blue-messenger/
 │       │       └── discovery/             # State, Intent/Event e ViewModel/Store de busca de pares
 │       ├── commonTest/kotlin/com/bluemessenger/
 │       │   ├── domain/                    # Testes unitários de regras de negócio e use cases
-│       │   └── protocol/                  # Testes de framing, fragmentação e serialização
+│       │   ├── protocol/                  # Testes de framing, fragmentação e serialização
+│       │   └── crypto/                    # Testes de AEAD, Noise XX, Double Ratchet e Safety Numbers
+│       ├── jvmCommonMain/kotlin/com/bluemessenger/ # Source set compartilhado entre androidMain e jvmMain (evita duplicação JVM)
+│       │   └── crypto/util/               # Implementação actual única de CryptoPrimitives via BouncyCastle Lightweight
 │       ├── androidMain/kotlin/com/bluemessenger/
+│       │   ├── crypto/                    # AndroidKeyStoreProvider
 │       │   ├── transport/android/         # Implementação RFCOMM/BLE com android.bluetooth.*
 │       │   └── di/                        # Wiring de dependências específicas do Android
 │       ├── androidUnitTest/kotlin/com/bluemessenger/
 │       ├── jvmMain/kotlin/com/bluemessenger/
+│       │   ├── crypto/                    # LinuxSecretServiceKeyStoreProvider
 │       │   ├── transport/linux/           # Implementação Bluetooth no Linux (BlueZ / DBus / Native Socket)
 │       │   └── di/                        # Wiring de dependências específicas do Linux Desktop
 │       └── jvmTest/kotlin/com/bluemessenger/
