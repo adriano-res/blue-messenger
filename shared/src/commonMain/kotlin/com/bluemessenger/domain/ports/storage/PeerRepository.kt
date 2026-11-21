@@ -1,4 +1,4 @@
-package com.bluemessenger.domain.ports.repository
+package com.bluemessenger.domain.ports.storage
 
 import com.bluemessenger.domain.model.Conversation
 import com.bluemessenger.domain.model.Peer

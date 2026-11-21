@@ -54,6 +54,14 @@ data class InvalidStateTransitionError(
 ) : DomainError
 
 /**
+ * Local persistence failure such as SQLite I/O errors, constraint violations, missing records
+ * required by a mutation, or corrupted stored values that cannot be mapped to domain models.
+ */
+data class StorageError(
+    override val message: String,
+) : DomainError
+
+/**
  * Exception carrier bridging [DomainError] values with Kotlin's [Result] failure channel.
  */
 class DomainException(

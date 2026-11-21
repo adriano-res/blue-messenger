@@ -4,6 +4,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.android.library)
+    alias(libs.plugins.sqldelight)
 }
 
 kotlin {
@@ -32,10 +33,22 @@ kotlin {
     sourceSets {
         commonMain.dependencies {
             implementation(libs.kotlinx.coroutines.core)
+            implementation(libs.sqldelight.coroutines.extensions)
+        }
+        androidMain.dependencies {
+            implementation(libs.sqldelight.android.driver)
+        }
+        jvmMain.dependencies {
+            implementation(libs.sqldelight.sqlite.driver)
         }
         val jvmCommonMain by getting {
             dependencies {
                 implementation(libs.bouncycastle.bcprov)
+            }
+        }
+        val jvmCommonTest by getting {
+            dependencies {
+                implementation(libs.sqldelight.sqlite.driver)
             }
         }
         commonTest.dependencies {
@@ -56,5 +69,14 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+sqldelight {
+    databases {
+        create("BlueMessengerDatabase") {
+            packageName.set("com.bluemessenger.storage")
+            dialect(libs.sqldelight.dialect.sqlite324)
+        }
     }
 }

@@ -1,0 +1,120 @@
+CREATE TABLE local_identity (
+    row_id INTEGER NOT NULL PRIMARY KEY CHECK (row_id = 1),
+    id TEXT NOT NULL,
+    nickname TEXT NOT NULL,
+    identity_public_key BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE peers (
+    id TEXT NOT NULL PRIMARY KEY,
+    nickname TEXT NOT NULL,
+    bluetooth_address TEXT NOT NULL UNIQUE,
+    identity_key BLOB,
+    is_verified INTEGER NOT NULL DEFAULT 0 CHECK (is_verified IN (0, 1)),
+    last_seen_at INTEGER NOT NULL
+);
+
+CREATE TABLE conversations (
+    id TEXT NOT NULL PRIMARY KEY,
+    peer_id TEXT NOT NULL UNIQUE REFERENCES peers(id) ON DELETE CASCADE,
+    state TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX conversations_updated_at_index ON conversations(updated_at);
+
+CREATE TABLE messages (
+    id TEXT NOT NULL PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    plaintext TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    status TEXT NOT NULL,
+    sent_at INTEGER NOT NULL,
+    delivered_at INTEGER
+);
+
+CREATE INDEX messages_conversation_sent_index ON messages(conversation_id, sent_at, id);
+
+CREATE INDEX messages_conversation_retry_index ON messages(conversation_id, direction, status, sent_at, id);
+
+selectLocalIdentity:
+SELECT * FROM local_identity WHERE row_id = :rowId;
+
+upsertLocalIdentity:
+INSERT INTO local_identity(row_id, id, nickname, identity_public_key, created_at)
+VALUES (:rowId, :id, :nickname, :identityPublicKey, :createdAt)
+ON CONFLICT(row_id) DO UPDATE SET
+    id = excluded.id,
+    nickname = excluded.nickname,
+    identity_public_key = excluded.identity_public_key,
+    created_at = excluded.created_at;
+
+selectAllPeers:
+SELECT * FROM peers ORDER BY last_seen_at DESC, id ASC;
+
+selectPeerById:
+SELECT * FROM peers WHERE id = :id;
+
+selectPeerByAddress:
+SELECT * FROM peers WHERE bluetooth_address = :bluetoothAddress;
+
+upsertPeer:
+INSERT INTO peers(id, nickname, bluetooth_address, identity_key, is_verified, last_seen_at)
+VALUES (:id, :nickname, :bluetoothAddress, :identityKey, :isVerified, :lastSeenAt)
+ON CONFLICT(id) DO UPDATE SET
+    nickname = excluded.nickname,
+    bluetooth_address = excluded.bluetooth_address,
+    identity_key = excluded.identity_key,
+    is_verified = excluded.is_verified,
+    last_seen_at = excluded.last_seen_at;
+
+updatePeerVerified:
+UPDATE peers SET is_verified = :isVerified WHERE id = :id;
+
+selectConversationsWithPeer:
+SELECT
+    conversations.id AS conversation_id,
+    conversations.state AS conversation_state,
+    conversations.updated_at AS conversation_updated_at,
+    peers.id AS peer_id,
+    peers.nickname AS peer_nickname,
+    peers.bluetooth_address AS peer_bluetooth_address,
+    peers.identity_key AS peer_identity_key,
+    peers.is_verified AS peer_is_verified,
+    peers.last_seen_at AS peer_last_seen_at
+FROM conversations
+INNER JOIN peers ON peers.id = conversations.peer_id
+ORDER BY conversations.updated_at DESC, conversations.id ASC;
+
+selectConversationByPeerId:
+SELECT * FROM conversations WHERE peer_id = :peerId;
+
+upsertConversation:
+INSERT INTO conversations(id, peer_id, state, updated_at)
+VALUES (:id, :peerId, :state, :updatedAt)
+ON CONFLICT(id) DO UPDATE SET
+    peer_id = excluded.peer_id,
+    state = excluded.state,
+    updated_at = excluded.updated_at;
+
+selectMessagesByConversation:
+SELECT * FROM messages WHERE conversation_id = :conversationId ORDER BY sent_at ASC, id ASC;
+
+selectMessageById:
+SELECT * FROM messages WHERE id = :id;
+
+selectMessagesByConversationDirectionAndStatuses:
+SELECT * FROM messages
+WHERE conversation_id = :conversationId AND direction = :direction AND status IN :statuses
+ORDER BY sent_at ASC, id ASC;
+
+insertMessageIgnoringDuplicate:
+INSERT OR IGNORE INTO messages(id, conversation_id, plaintext, direction, status, sent_at, delivered_at)
+VALUES (:id, :conversationId, :plaintext, :direction, :status, :sentAt, :deliveredAt);
+
+updateMessageStatus:
+UPDATE messages SET status = :status, delivered_at = :deliveredAt WHERE id = :id;
+
+selectChangedRowCount:
+SELECT changes();

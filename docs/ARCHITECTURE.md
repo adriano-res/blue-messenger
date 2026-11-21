@@ -19,13 +19,13 @@ flowchart TD
         subgraph Ports["Portas / Contratos"]
             PortCrypto["CryptoService (Interface)"]
             PortBT["BluetoothTransport (Interface)"]
-            PortRepo["MessageRepository (Interface)"]
+            PortStorage["MessageRepository (Interface)"]
         end
     end
 
     subgraph Infra["3. Infraestrutura"]
         Crypto["crypto/ (Criptografia E2EE)"]
-        Data["data/ (Banco SQLite)"]
+        Storage["storage/ (Banco SQLite)"]
         BT_Android["transport/ (Bluetooth Android)"]
         BT_Linux["transport/ (Bluetooth Linux)"]
     end
@@ -35,10 +35,10 @@ flowchart TD
     UC --> Model
     UC --> PortCrypto
     UC --> PortBT
-    UC --> PortRepo
+    UC --> PortStorage
 
     Crypto -. implementa .-> PortCrypto
-    Data -. implementa .-> PortRepo
+    Storage -. implementa .-> PortStorage
     BT_Android -. implementa .-> PortBT
     BT_Linux -. implementa .-> PortBT
 ```
@@ -71,7 +71,7 @@ blue-messenger/
 │       │   │   ├── ports/                 # Portas (interfaces/contratos) do domínio
 │       │   │   │   ├── crypto/            # Portas criptográficas (CryptoService, KeyStoreProvider, HandshakeStepResult)
 │       │   │   │   ├── transport/         # Portas de Bluetooth e constantes (BluetoothTransport, BluetoothScanner, TransportConstants)
-│       │   │   │   └── repository/        # Interfaces de repositório (MessageRepository, PeerRepository, IdentityRepository)
+│       │   │   │   └── storage/           # Interfaces de persistência (MessageRepository, PeerRepository, IdentityRepository)
 │       │   │   └── usecase/               # Casos de uso de negócio
 │       │   ├── crypto/                    # Motor Criptográfico Concreto (DefaultCryptoService, NoiseXxHandshake, DoubleRatchetSession, ChaCha20Poly1305Cipher, SafetyNumberGenerator)
 │       │   │   ├── model/                 # Modelos criptográficos (IdentityKeyPair, EphemeralKeyPair, RatchetHeader)
@@ -82,9 +82,9 @@ blue-messenger/
 │       │   │   ├── util/                  # Utilitários de apoio binário (Crc32Checksum, BigEndianBytes)
 │       │   │   ├── constants/             # Constantes de protocolo e opcodes (FrameConstants, PacketConstants)
 │       │   │   └── error/                 # Erros tipados de framing e pacote (FrameError, PacketError)
-│       │   ├── data/
-│       │   │   ├── repository/            # Implementações de repositório (SQLDelight / InMemory)
-│       │   │   └── mapper/                # Mappers entre entidades de banco/rede e domínio
+│       │   ├── storage/                   # Persistência Local Multiplataforma (SQLDelight)
+│       │   │   ├── repository/            # Implementações de repositório (SqlDelightMessageRepository, etc.)
+│       │   │   └── mapper/                # Mappers entre registros SQLDelight e entidades imutáveis de domínio (PeerMapper, ConversationMapper, MessageMapper, IdentityMapper)
 │       │   └── presentation/
 │       │       ├── chat/                  # State, Intent/Event e ViewModel/Store da conversa
 │       │       └── discovery/             # State, Intent/Event e ViewModel/Store de busca de pares

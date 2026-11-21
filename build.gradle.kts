@@ -1,5 +1,6 @@
 import io.gitlab.arturbosch.detekt.Detekt
 import io.gitlab.arturbosch.detekt.extensions.DetektExtension
+import org.jlleitschuh.gradle.ktlint.KtlintExtension
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform) apply false
@@ -8,6 +9,7 @@ plugins {
     alias(libs.plugins.android.library) apply false
     alias(libs.plugins.detekt) apply false
     alias(libs.plugins.ktlint) apply false
+    alias(libs.plugins.sqldelight) apply false
 }
 
 subprojects {
@@ -20,7 +22,14 @@ subprojects {
         parallel = true
     }
 
+    extensions.configure<KtlintExtension> {
+        filter {
+            exclude { element -> element.file.path.contains("/build/generated/") }
+        }
+    }
+
     tasks.withType<Detekt>().configureEach {
+        exclude { element -> element.file.invariantSeparatorsPath.contains("/build/generated/") }
         jvmTarget = "17"
         reports {
             html.required.set(true)
