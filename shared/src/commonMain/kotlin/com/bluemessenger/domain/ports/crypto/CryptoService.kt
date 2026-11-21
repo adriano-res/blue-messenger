@@ -1,6 +1,7 @@
 package com.bluemessenger.domain.ports.crypto
 
 import com.bluemessenger.domain.error.DomainException
+import com.bluemessenger.domain.ports.crypto.model.HandshakeStepResult
 import com.bluemessenger.domain.primitives.PeerId
 import com.bluemessenger.domain.primitives.PublicKey
 

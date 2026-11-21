@@ -4,8 +4,8 @@ import com.bluemessenger.crypto.util.ByteArrayZeroizer
 import com.bluemessenger.domain.error.InvalidStateTransitionError
 import com.bluemessenger.domain.error.asFailure
 import com.bluemessenger.domain.ports.crypto.CryptoService
-import com.bluemessenger.domain.ports.crypto.HandshakeStepResult
 import com.bluemessenger.domain.ports.crypto.KeyStoreProvider
+import com.bluemessenger.domain.ports.crypto.model.HandshakeStepResult
 import com.bluemessenger.domain.primitives.PeerId
 import com.bluemessenger.domain.primitives.PublicKey
 import kotlinx.coroutines.sync.Mutex

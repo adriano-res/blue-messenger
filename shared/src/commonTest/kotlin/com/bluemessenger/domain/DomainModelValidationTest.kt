@@ -16,8 +16,8 @@ import com.bluemessenger.domain.error.toDomainErrorOrNull
 import com.bluemessenger.domain.model.LocalIdentity
 import com.bluemessenger.domain.model.Message
 import com.bluemessenger.domain.model.Peer
-import com.bluemessenger.domain.ports.crypto.HandshakeStepResult
-import com.bluemessenger.domain.ports.transport.TransportConstants
+import com.bluemessenger.domain.ports.crypto.model.HandshakeStepResult
+import com.bluemessenger.domain.ports.transport.constants.TransportConstants
 import com.bluemessenger.domain.primitives.BluetoothAddress
 import com.bluemessenger.domain.primitives.ConversationId
 import com.bluemessenger.domain.primitives.Instant

@@ -62,6 +62,20 @@ data class StorageError(
 ) : DomainError
 
 /**
+ * Validation failure caused by blank, empty, or malformed domain input arguments.
+ */
+data class InvalidInputError(
+    override val message: String,
+) : DomainError
+
+/**
+ * Cryptographic handshake did not complete within the allowed timeout window.
+ */
+data class HandshakeTimeoutError(
+    override val message: String = "Cryptographic handshake timed out.",
+) : DomainError
+
+/**
  * Exception carrier bridging [DomainError] values with Kotlin's [Result] failure channel.
  */
 class DomainException(
