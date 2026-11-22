@@ -40,6 +40,8 @@ kotlin {
         }
         jvmMain.dependencies {
             implementation(libs.sqldelight.sqlite.driver)
+            implementation(libs.dbus.java.core)
+            implementation(libs.dbus.java.transport.junixsocket)
         }
         val jvmCommonMain by getting {
             dependencies {

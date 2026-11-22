@@ -105,14 +105,14 @@ blue-messenger/
 │       ├── androidMain/kotlin/com/bluemessenger/
 │       │   ├── crypto/                    # AndroidKeyStoreProvider
 │       │   ├── logging/                   # AndroidAppLoggerImpl (android.util.Log)
-│       │   ├── transport/android/         # Implementação RFCOMM/BLE com android.bluetooth.*
-│       │   └── di/                        # Wiring de dependências específicas do Android
+│       │   ├── transport/                 # Implementação RFCOMM/BLE com android.bluetooth.*
+│       │   └── AndroidAppModule.kt        # Wiring de dependências específicas do Android
 │       ├── androidUnitTest/kotlin/com/bluemessenger/
 │       ├── jvmMain/kotlin/com/bluemessenger/
 │       │   ├── crypto/                    # LinuxSecretServiceKeyStoreProvider
 │       │   ├── logging/                   # JvmAppLoggerImpl (java.util.logging.Logger)
-│       │   ├── transport/linux/           # Implementação Bluetooth no Linux (BlueZ / DBus / Native Socket)
-│       │   └── di/                        # Wiring de dependências específicas do Linux Desktop
+│       │   ├── transport/                 # Implementação Bluetooth no Linux (BlueZ D-Bus / RFCOMM)
+│       │   └── LinuxAppModule.kt          # Wiring de dependências específicas do Linux Desktop
 │       └── jvmTest/kotlin/com/bluemessenger/
 ├── androidApp/                            # Entrypoint Android (Activity, AndroidManifest, Permissões)
 │   ├── build.gradle.kts
@@ -197,7 +197,7 @@ classDiagram
 2. **`crypto`, `storage` e `transport` implementam as 3 portas principais definidas no `domain`** (além de adaptadores nativos de `logging`):
    - `crypto/` implementa o contrato `CryptoService` (utilizando Double Ratchet, X25519 e ChaCha20-Poly1305).
    - `storage/` implementa `MessageRepository`, `PeerRepository` e `IdentityRepository` (utilizando SQLDelight/SQLite).
-   - `androidMain/transport/android/` e `jvmMain/transport/linux/` implementam `BluetoothTransport` (trocando `Packet` tipados) e `BluetoothScanner` para Android SDK e Linux BlueZ respectivamente.
+   - `androidMain/transport/` e `jvmMain/transport/` implementam `BluetoothTransport` (trocando `Packet` tipados) e `BluetoothScanner` para Android SDK e Linux BlueZ respectivamente.
    - `androidMain/logging/` e `jvmMain/logging/` implementam `AppLogger` nativamente sem dependências externas (`AndroidAppLoggerImpl` via `android.util.Log` e `JvmAppLoggerImpl` via `java.util.logging.Logger`).
 3. **`transport/protocol` é o motor binário interno de fio e framing dos adaptadores `transport`**:
    - Responsável pela codificação/decodificação de pacotes (`PacketCodec`) e frames binários com prefixo de tamanho e validação de integridade CRC32 (`FrameEncoder`, `FrameDecoder`) consumidos exclusivamente pelas implementações de `BluetoothTransport`.
