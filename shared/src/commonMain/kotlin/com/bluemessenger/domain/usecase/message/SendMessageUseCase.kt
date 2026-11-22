@@ -6,6 +6,8 @@ import com.bluemessenger.domain.enums.MessageDirection
 import com.bluemessenger.domain.enums.MessageStatus
 import com.bluemessenger.domain.enums.SessionState
 import com.bluemessenger.domain.error.InvalidInputError
+import com.bluemessenger.domain.error.InvalidStateTransitionError
+import com.bluemessenger.domain.error.StorageError
 import com.bluemessenger.domain.error.asFailure
 import com.bluemessenger.domain.model.Message
 import com.bluemessenger.domain.ports.logging.AppLogger
@@ -72,26 +74,136 @@ class SendMessageUseCase(
                     return@withContext Result.failure(it)
                 }
 
-            val isPeerSessionActive =
-                isPeerSessionActive(peerId, conversationId).getOrElse {
-                    return@withContext Result.failure(it)
-                }
-            if (!isPeerSessionActive) {
-                logger.info(
+            deliverOrQueue(peerId, message, ackTimeoutScope)
+        }
+
+    /**
+     * Retries a `FAILED` outgoing message identified by [messageId], transitioning it back to
+     * `PENDING` while preserving its [MessageId] for end-to-end idempotency, and transmitting it
+     * immediately if [peerId] has an active session.
+     */
+    suspend fun retryFailedMessage(
+        peerId: PeerId,
+        messageId: MessageId,
+        ackTimeoutScope: CoroutineScope? = null,
+    ): Result<Message> =
+        withContext(dispatchers.io) {
+            val existing =
+                messageRepository.getById(messageId).getOrElse { error ->
+                    logger.error(
+                        tag = TAG,
+                        message = "Failed to load message for retry.",
+                        throwable = error,
+                        context = mapOf("messageId" to messageId.toString()),
+                    )
+                    return@withContext Result.failure(error)
+                } ?: return@withContext StorageError("Message $messageId was not found.").asFailure()
+
+            if (existing.direction != MessageDirection.OUTGOING || existing.status != MessageStatus.FAILED) {
+                logger.warn(
                     tag = TAG,
-                    message = "Queued outgoing message as PENDING while peer session is inactive.",
+                    message = "Rejected retry for message in invalid direction or status.",
                     context =
                         mapOf(
-                            "messageId" to message.id.toString(),
-                            "conversationId" to conversationId.toString(),
-                            "transportState" to bluetoothTransport.sessionState.value.name,
+                            "messageId" to messageId.toString(),
+                            "direction" to existing.direction.name,
+                            "status" to existing.status.name,
                         ),
                 )
-                return@withContext Result.success(message)
+                return@withContext InvalidStateTransitionError(
+                    entity = ENTITY_MESSAGE,
+                    fromState = existing.status.name,
+                    toState = MessageStatus.PENDING.name,
+                    message = "Only FAILED outgoing messages can be retried.",
+                ).asFailure()
             }
 
-            transmitAndScheduleAckTimeout(peerId, message, ackTimeoutScope)
+            verifyConversationOwnership(peerId, existing).onFailure {
+                return@withContext Result.failure(it)
+            }
+
+            messageRepository.updateStatus(existing.id, MessageStatus.PENDING).getOrElse { error ->
+                logger.error(
+                    tag = TAG,
+                    message = "Failed to transition FAILED message back to PENDING.",
+                    throwable = error,
+                    context = mapOf("messageId" to messageId.toString()),
+                )
+                return@withContext Result.failure(error)
+            }
+
+            val pendingMessage = existing.copy(status = MessageStatus.PENDING, deliveredAt = null)
+            deliverOrQueue(peerId, pendingMessage, ackTimeoutScope)
         }
+
+    private suspend fun verifyConversationOwnership(
+        peerId: PeerId,
+        message: Message,
+    ): Result<Unit> =
+        peerRepository.getConversationByPeer(peerId).fold(
+            onSuccess = { conversation ->
+                if (conversation?.id == message.conversationId) {
+                    Result.success(Unit)
+                } else {
+                    logger.warn(
+                        tag = TAG,
+                        message = "Rejected retry for message belonging to a different peer conversation.",
+                        context =
+                            mapOf(
+                                "peerId" to peerId.toString(),
+                                "messageId" to message.id.toString(),
+                                "expectedConversationId" to message.conversationId.toString(),
+                                "actualConversationId" to (conversation?.id?.toString() ?: STATE_NONE),
+                            ),
+                    )
+                    InvalidStateTransitionError(
+                        entity = ENTITY_MESSAGE,
+                        fromState = message.status.name,
+                        toState = MessageStatus.PENDING.name,
+                        message = "Message ${message.id} does not belong to peer $peerId.",
+                    ).asFailure()
+                }
+            },
+            onFailure = { error ->
+                logger.error(
+                    tag = TAG,
+                    message = "Failed to verify peer conversation ownership before message retry.",
+                    throwable = error,
+                    context =
+                        mapOf(
+                            "peerId" to peerId.toString(),
+                            "messageId" to message.id.toString(),
+                        ),
+                )
+                Result.failure(error)
+            },
+        )
+
+    private suspend fun deliverOrQueue(
+        peerId: PeerId,
+        message: Message,
+        ackTimeoutScope: CoroutineScope?,
+    ): Result<Message> =
+        isPeerSessionActive(peerId, message.conversationId).fold(
+            onSuccess = { isPeerSessionActive ->
+                if (!isPeerSessionActive) {
+                    logger.info(
+                        tag = TAG,
+                        message = "Queued outgoing message as PENDING while peer session is inactive.",
+                        context =
+                            mapOf(
+                                "messageId" to message.id.toString(),
+                                "conversationId" to message.conversationId.toString(),
+                                "transportState" to bluetoothTransport.sessionState.value.name,
+                            ),
+                    )
+                    Result.success(message)
+                } else {
+                    transmitAndScheduleAckTimeout(peerId, message, ackTimeoutScope)
+                }
+            },
+            onFailure = { Result.failure(it) },
+        )
 
     private suspend fun persistPendingMessage(
         conversationId: ConversationId,
@@ -139,7 +251,10 @@ class SendMessageUseCase(
                         ),
                 )
             }.map { conversation ->
-                conversation?.state == SessionState.SECURE_ACTIVE && bluetoothTransport.hasOpenTransportLink()
+                conversation != null &&
+                    conversation.id == conversationId &&
+                    conversation.state == SessionState.SECURE_ACTIVE &&
+                    bluetoothTransport.hasOpenTransportLink()
             }
 
     private suspend fun transmitAndScheduleAckTimeout(
@@ -238,5 +353,7 @@ class SendMessageUseCase(
 
     private companion object {
         private const val TAG: String = "SendMessageUseCase"
+        private const val ENTITY_MESSAGE: String = "Message"
+        private const val STATE_NONE: String = "NONE"
     }
 }

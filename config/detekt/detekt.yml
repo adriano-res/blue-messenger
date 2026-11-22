@@ -84,3 +84,10 @@ complexity:
     thresholdInObjects: 20
     ignorePrivate: true
     ignoreOverridden: true
+
+naming:
+  active: true
+  FunctionNaming:
+    active: true
+    ignoreAnnotated:
+      - 'Composable'

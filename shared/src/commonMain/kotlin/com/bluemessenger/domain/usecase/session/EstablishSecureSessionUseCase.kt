@@ -132,6 +132,95 @@ class EstablishSecureSessionUseCase(
             runResponderHandshake(peer, handshakingConv)
         }
 
+    /**
+     * Clears ephemeral cryptographic session state for [peerId], closes the active Bluetooth
+     * transport link, and transitions any persisted conversation for [peerId] to
+     * [SessionState.DISCONNECTED].
+     */
+    suspend fun disconnect(peerId: PeerId): Result<Unit> =
+        withContext(dispatchers.io) {
+            val clearOutcome =
+                cryptoService.clearSession(peerId).onFailure { error ->
+                    logger.warn(
+                        tag = TAG,
+                        message = "Failed to clear crypto session during manual disconnect.",
+                        throwable = error,
+                        context = mapOf("peerId" to peerId.toString()),
+                    )
+                }
+            val transportOutcome =
+                bluetoothTransport.disconnect().onFailure { error ->
+                    logger.warn(
+                        tag = TAG,
+                        message = "Failed to disconnect Bluetooth transport during manual disconnect.",
+                        throwable = error,
+                        context = mapOf("peerId" to peerId.toString()),
+                    )
+                }
+            val storageOutcome = persistDisconnectedConversation(peerId)
+            val firstFailure =
+                clearOutcome.exceptionOrNull()
+                    ?: transportOutcome.exceptionOrNull()
+                    ?: storageOutcome.exceptionOrNull()
+            if (firstFailure != null) {
+                Result.failure(firstFailure)
+            } else {
+                logger.info(
+                    tag = TAG,
+                    message = "Disconnected peer session.",
+                    context = mapOf("peerId" to peerId.toString()),
+                )
+                Result.success(Unit)
+            }
+        }
+
+    private suspend fun persistDisconnectedConversation(peerId: PeerId): Result<Unit> =
+        peerRepository.getConversationByPeer(peerId).fold(
+            onSuccess = { conversation ->
+                if (conversation == null || conversation.state == SessionState.DISCONNECTED) {
+                    Result.success(Unit)
+                } else {
+                    transitionConversationDisconnected(conversation)
+                }
+            },
+            onFailure = { error ->
+                logger.error(
+                    tag = TAG,
+                    message = "Failed to load peer conversation during disconnect.",
+                    throwable = error,
+                    context = mapOf("peerId" to peerId.toString()),
+                )
+                Result.failure(error)
+            },
+        )
+
+    private suspend fun transitionConversationDisconnected(conversation: Conversation): Result<Unit> =
+        conversation.transitionSessionState(SessionState.DISCONNECTED, clock()).fold(
+            onSuccess = { disconnected ->
+                peerRepository.upsertConversation(disconnected).onFailure { persistError ->
+                    logger.error(
+                        tag = TAG,
+                        message = "Failed to persist DISCONNECTED conversation state.",
+                        throwable = persistError,
+                        context = mapOf("conversationId" to conversation.id.toString()),
+                    )
+                }
+            },
+            onFailure = { transitionError ->
+                logger.warn(
+                    tag = TAG,
+                    message = "Could not transition conversation to DISCONNECTED.",
+                    throwable = transitionError,
+                    context =
+                        mapOf(
+                            "conversationId" to conversation.id.toString(),
+                            "currentState" to conversation.state.name,
+                        ),
+                )
+                Result.failure(transitionError)
+            },
+        )
+
     private suspend fun runInitiatorHandshake(
         peer: Peer,
         handshakingConv: Conversation,

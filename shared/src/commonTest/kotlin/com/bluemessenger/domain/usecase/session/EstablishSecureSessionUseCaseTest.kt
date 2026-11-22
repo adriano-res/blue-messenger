@@ -236,4 +236,22 @@ class EstablishSecureSessionUseCaseTest {
             assertEquals(1, transport.disconnectCount)
             assertEquals(SessionState.DISCONNECTED, peerRepo.getConversationByPeer(bob.id).getOrThrow()?.state)
         }
+
+    @Test
+    fun `disconnect clears crypto session, closes transport, and persists DISCONNECTED conversation`() =
+        runTest {
+            val harness = createPairedActiveSession()
+            val unknownPeerId = PeerId.generate(Instant(1_700_000_000_500L))
+            assertTrue(harness.alice.establish.disconnect(unknownPeerId).isSuccess)
+
+            val disconnectBefore = harness.alice.transport.disconnectCount
+            harness.alice.establish.disconnect(harness.bobPeer.id).getOrThrow()
+
+            assertEquals(disconnectBefore + 1, harness.alice.transport.disconnectCount)
+            assertEquals(
+                SessionState.DISCONNECTED,
+                harness.alice.peerRepo.getConversationByPeer(harness.bobPeer.id).getOrThrow()?.state,
+            )
+            assertEquals(SessionState.DISCONNECTED, harness.alice.transport.sessionState.value)
+        }
 }

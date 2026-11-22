@@ -8,10 +8,13 @@ import com.bluemessenger.domain.enums.MessageDirection
 import com.bluemessenger.domain.enums.MessageStatus
 import com.bluemessenger.domain.enums.SessionState
 import com.bluemessenger.domain.error.InvalidInputError
+import com.bluemessenger.domain.error.InvalidStateTransitionError
 import com.bluemessenger.domain.error.StorageError
 import com.bluemessenger.domain.error.TransportDisconnectedError
 import com.bluemessenger.domain.error.toDomainErrorOrNull
+import com.bluemessenger.domain.model.Conversation
 import com.bluemessenger.domain.model.Message
+import com.bluemessenger.domain.model.Peer
 import com.bluemessenger.domain.ports.transport.BluetoothTransport
 import com.bluemessenger.domain.ports.transport.model.AckPacket
 import com.bluemessenger.domain.ports.transport.model.EncryptedPayloadPacket
@@ -356,6 +359,105 @@ class SendMessageAndAckUseCaseTest {
 
             assertTrue(job.isCompleted)
             assertTrue(logger.entries.any { it.level == FakeAppLogger.Level.ERROR })
+        }
+
+    @Test
+    fun `retryFailedMessage preserves MessageId, delivers active, queues offline, and rejects bad state`() =
+        runTest {
+            val harness = createPairedActiveSession()
+            val dispatchers = testDispatchers(testScheduler)
+            val now = Instant(1_700_000_000_000L)
+            harness.alice.transport.onSend = { Result.success(Unit) }
+            val sendUseCase = buildSendUseCase(harness.alice, dispatchers) { now }
+
+            val failedMsg =
+                sendUseCase(
+                    harness.bobPeer.id,
+                    harness.aliceConversation.id,
+                    "Retry me",
+                    ackTimeoutScope = this,
+                ).getOrThrow()
+            advanceTimeBy(SessionConstants.ACK_TIMEOUT_MS)
+            runCurrent()
+            assertEquals(MessageStatus.FAILED, harness.alice.messageRepo.getById(failedMsg.id).getOrThrow()?.status)
+
+            val bobJob =
+                buildObserver(harness.bob, dispatchers) { now }(
+                    this,
+                    harness.alicePeer.id,
+                    harness.bobConversation.id,
+                )
+            val aliceJob =
+                buildObserver(harness.alice, dispatchers) { now }(
+                    this,
+                    harness.bobPeer.id,
+                    harness.aliceConversation.id,
+                )
+            harness.wireDuplexTransports()
+            runCurrent()
+
+            val retried =
+                sendUseCase.retryFailedMessage(harness.bobPeer.id, failedMsg.id, ackTimeoutScope = this)
+                    .getOrThrow()
+            assertEquals(failedMsg.id, retried.id)
+            runCurrent()
+            assertEquals(MessageStatus.DELIVERED, harness.alice.messageRepo.getById(failedMsg.id).getOrThrow()?.status)
+
+            val deliveredRetryFailure = sendUseCase.retryFailedMessage(harness.bobPeer.id, failedMsg.id)
+            assertIs<InvalidStateTransitionError>(deliveredRetryFailure.exceptionOrNull()?.toDomainErrorOrNull())
+
+            val missingRetryFailure = sendUseCase.retryFailedMessage(harness.bobPeer.id, MessageId.generate(now))
+            assertIs<StorageError>(missingRetryFailure.exceptionOrNull()?.toDomainErrorOrNull())
+
+            harness.alice.transport.failSendAfterCount = harness.alice.transport.sentPackets.size
+            val immediateFail = sendUseCase(harness.bobPeer.id, harness.aliceConversation.id, "Offline retry")
+            assertTrue(immediateFail.isFailure)
+            val failedOfflineId = harness.alice.messageRepo.allMessages().last().id
+            harness.alice.transport.disconnect().getOrThrow()
+
+            val queuedRetry = sendUseCase.retryFailedMessage(harness.bobPeer.id, failedOfflineId).getOrThrow()
+            assertEquals(failedOfflineId, queuedRetry.id)
+            assertEquals(MessageStatus.PENDING, queuedRetry.status)
+
+            bobJob.cancel()
+            aliceJob.cancel()
+        }
+
+    @Test
+    fun `retryFailedMessage rejects cross-peer retry even when target peer has SECURE_ACTIVE`() =
+        runTest {
+            val harness = createPairedActiveSession()
+            val dispatchers = testDispatchers(testScheduler)
+            val now = Instant(1_700_000_000_000L)
+            val sendUseCase = buildSendUseCase(harness.alice, dispatchers) { now }
+
+            val otherPeer =
+                Peer(
+                    PeerId.generate(Instant(now.epochMillis + 99L)),
+                    "Carol",
+                    BluetoothAddress("22:33:44:55:66:77"),
+                    lastSeenAt = now,
+                )
+            val otherConv =
+                Conversation(
+                    id = ConversationId.generate(Instant(now.epochMillis + 99L)),
+                    peer = otherPeer,
+                    state = SessionState.DISCONNECTED,
+                    updatedAt = now,
+                ).transitionSessionState(SessionState.CONNECTING, now).getOrThrow()
+                    .transitionSessionState(SessionState.HANDSHAKING, now).getOrThrow()
+                    .transitionSessionState(SessionState.SECURE_ACTIVE, now).getOrThrow()
+            harness.alice.peerRepo.upsertConversation(otherConv).getOrThrow()
+            harness.alice.transport.failSendAfterCount = harness.alice.transport.sentPackets.size
+            assertTrue(sendUseCase(harness.bobPeer.id, harness.aliceConversation.id, "Owned by Bob").isFailure)
+            val bobFailedId = harness.alice.messageRepo.allMessages().last().id
+            harness.alice.transport.failSendAfterCount = null
+
+            val packetsBeforeCrossRetry = harness.alice.transport.sentPackets.size
+            val crossPeerRetry = sendUseCase.retryFailedMessage(otherPeer.id, bobFailedId)
+            assertIs<InvalidStateTransitionError>(crossPeerRetry.exceptionOrNull()?.toDomainErrorOrNull())
+            assertEquals(packetsBeforeCrossRetry, harness.alice.transport.sentPackets.size)
+            assertEquals(MessageStatus.FAILED, harness.alice.messageRepo.getById(bobFailedId).getOrThrow()?.status)
         }
 
     private fun buildSendUseCase(

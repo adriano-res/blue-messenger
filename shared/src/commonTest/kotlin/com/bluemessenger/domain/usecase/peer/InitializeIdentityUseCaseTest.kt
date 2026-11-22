@@ -178,4 +178,30 @@ class InitializeIdentityUseCaseTest {
             assertNotEquals(first.id, reinitialized.id)
             assertTrue(warnLogger.entries.any { it.level == FakeAppLogger.Level.WARN })
         }
+
+    @Test
+    fun `loadExisting returns null on fresh boot, returns persisted identity when valid, and propagates errors`() =
+        runTest {
+            val identityRepo = InMemoryIdentityRepository()
+            val keyStore = FakeKeyStoreProvider()
+            val useCase =
+                InitializeIdentityUseCase(
+                    identityRepository = identityRepo,
+                    keyStoreProvider = keyStore,
+                    dispatchers = testDispatchers(testScheduler),
+                    logger = FakeAppLogger(),
+                    clock = { Instant(1_000L) },
+                )
+
+            assertNull(useCase.loadExisting().getOrThrow())
+
+            val created = useCase("Alice").getOrThrow()
+            assertEquals(created, useCase.loadExisting().getOrThrow())
+
+            keyStore.setKeyPair(IdentityKeyPair.generate())
+            assertNull(useCase.loadExisting().getOrThrow())
+
+            identityRepo.getFailure = StorageError("read failure")
+            assertIs<StorageError>(useCase.loadExisting().exceptionOrNull()?.toDomainErrorOrNull())
+        }
 }

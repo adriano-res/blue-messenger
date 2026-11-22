@@ -3,6 +3,8 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
+    alias(libs.plugins.compose.multiplatform)
+    alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.android.library)
     alias(libs.plugins.sqldelight)
 }
@@ -34,6 +36,10 @@ kotlin {
         commonMain.dependencies {
             implementation(libs.kotlinx.coroutines.core)
             implementation(libs.sqldelight.coroutines.extensions)
+            implementation(compose.runtime)
+            implementation(compose.foundation)
+            implementation(compose.material3)
+            implementation(compose.ui)
         }
         androidMain.dependencies {
             implementation(libs.sqldelight.android.driver)
@@ -46,6 +52,7 @@ kotlin {
         val jvmCommonMain by getting {
             dependencies {
                 implementation(libs.bouncycastle.bcprov)
+                implementation(libs.zxing.core)
             }
         }
         val jvmCommonTest by getting {

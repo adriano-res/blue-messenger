@@ -35,28 +35,47 @@ class InitializeIdentityUseCase(
      */
     suspend operator fun invoke(nickname: String): Result<LocalIdentity> =
         withContext(dispatchers.default) {
-            val existingIdentity =
-                identityRepository.getLocalIdentity().getOrElse { error ->
-                    logger.error(
-                        tag = TAG,
-                        message = "Failed to load persisted local identity.",
-                        throwable = error,
-                    )
-                    return@withContext Result.failure(error)
-                }
-            val hasKeyPair =
-                keyStoreProvider.hasIdentityKeyPair().getOrElse { error ->
-                    logger.error(
-                        tag = TAG,
-                        message = "Failed to verify identity key pair in keystore.",
-                        throwable = error,
-                    )
-                    return@withContext Result.failure(error)
-                }
-
+            val (existingIdentity, hasKeyPair) =
+                loadIdentityState().getOrElse { return@withContext Result.failure(it) }
             val reusable = resolveExistingIdentity(existingIdentity, hasKeyPair)
             reusable ?: createAndPersistIdentity(nickname, hasKeyPair)
         }
+
+    /**
+     * Loads and verifies an existing [LocalIdentity] against the hardware keystore without
+     * creating a new profile or requiring a nickname. Returns `null` when no valid identity exists.
+     */
+    suspend fun loadExisting(): Result<LocalIdentity?> =
+        withContext(dispatchers.default) {
+            val (existingIdentity, hasKeyPair) =
+                loadIdentityState().getOrElse { return@withContext Result.failure(it) }
+            resolveExistingIdentity(existingIdentity, hasKeyPair) ?: Result.success(null)
+        }
+
+    private suspend fun loadIdentityState(): Result<Pair<LocalIdentity?, Boolean>> =
+        identityRepository.getLocalIdentity().fold(
+            onSuccess = { existingIdentity ->
+                keyStoreProvider.hasIdentityKeyPair().fold(
+                    onSuccess = { hasKeyPair -> Result.success(existingIdentity to hasKeyPair) },
+                    onFailure = { error ->
+                        logger.error(
+                            tag = TAG,
+                            message = "Failed to verify identity key pair in keystore.",
+                            throwable = error,
+                        )
+                        Result.failure(error)
+                    },
+                )
+            },
+            onFailure = { error ->
+                logger.error(
+                    tag = TAG,
+                    message = "Failed to load persisted local identity.",
+                    throwable = error,
+                )
+                Result.failure(error)
+            },
+        )
 
     private suspend fun resolveExistingIdentity(
         existingIdentity: LocalIdentity?,
