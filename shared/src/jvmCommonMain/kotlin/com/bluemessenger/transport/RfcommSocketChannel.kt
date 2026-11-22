@@ -6,7 +6,7 @@ import com.bluemessenger.domain.error.TransportDisconnectedError
 import com.bluemessenger.domain.error.asFailure
 import com.bluemessenger.domain.ports.logging.AppLogger
 import com.bluemessenger.domain.ports.transport.model.Packet
-import com.bluemessenger.transport.constants.LinuxTransportConstants
+import com.bluemessenger.transport.constants.RfcommChannelConstants
 import com.bluemessenger.transport.protocol.FrameDecoder
 import com.bluemessenger.transport.protocol.FrameEncoder
 import com.bluemessenger.transport.protocol.PacketCodec
@@ -51,7 +51,7 @@ class RfcommSocketChannel(
     private val closeable: Closeable,
     private val dispatchers: CoroutineDispatchers,
     private val logger: AppLogger,
-    private val readBufferSize: Int = LinuxTransportConstants.RFCOMM_READ_BUFFER_SIZE_BYTES,
+    private val readBufferSize: Int = RfcommChannelConstants.RFCOMM_READ_BUFFER_SIZE_BYTES,
 ) : Closeable {
     private val writeMutex: Mutex = Mutex()
     private val closed: AtomicBoolean = AtomicBoolean(false)
@@ -98,7 +98,7 @@ class RfcommSocketChannel(
                         throw cancellation
                     } catch (exception: IOException) {
                         logger.warn(
-                            tag = LinuxTransportConstants.TAG_RFCOMM_CHANNEL,
+                            tag = RfcommChannelConstants.TAG_RFCOMM_CHANNEL,
                             message = "Failed to write frame to RFCOMM stream; closing channel.",
                             throwable = exception,
                             context = mapOf("frameBytes" to frameBytes.size.toString()),
@@ -165,9 +165,9 @@ class RfcommSocketChannel(
             val bytesRead = readChunkOrNull(readBuffer)
             when {
                 bytesRead == null -> streamOpen = false
-                bytesRead == LinuxTransportConstants.EOF_MARKER -> {
+                bytesRead == RfcommChannelConstants.EOF_MARKER -> {
                     logger.info(
-                        tag = LinuxTransportConstants.TAG_RFCOMM_CHANNEL,
+                        tag = RfcommChannelConstants.TAG_RFCOMM_CHANNEL,
                         message = "RFCOMM peer closed stream (EOF).",
                     )
                     streamOpen = false
@@ -194,7 +194,7 @@ class RfcommSocketChannel(
                 null
             } else {
                 logger.warn(
-                    tag = LinuxTransportConstants.TAG_RFCOMM_CHANNEL,
+                    tag = RfcommChannelConstants.TAG_RFCOMM_CHANNEL,
                     message = "RFCOMM stream read failed; closing channel.",
                     throwable = exception,
                 )
@@ -220,7 +220,7 @@ class RfcommSocketChannel(
             },
             onFailure = { error ->
                 logger.warn(
-                    tag = LinuxTransportConstants.TAG_RFCOMM_CHANNEL,
+                    tag = RfcommChannelConstants.TAG_RFCOMM_CHANNEL,
                     message = "Discarded corrupted RFCOMM frame while keeping stream active.",
                     throwable = error,
                     context = mapOf("chunkBytes" to chunk.size.toString()),
@@ -234,7 +234,7 @@ class RfcommSocketChannel(
             onSuccess = { packet -> emit(packet) },
             onFailure = { error ->
                 logger.warn(
-                    tag = LinuxTransportConstants.TAG_RFCOMM_CHANNEL,
+                    tag = RfcommChannelConstants.TAG_RFCOMM_CHANNEL,
                     message = "Discarded malformed RFCOMM packet while keeping stream active.",
                     throwable = error,
                     context = mapOf("payloadBytes" to payload.size.toString()),
@@ -251,7 +251,7 @@ class RfcommSocketChannel(
             resource.close()
         } catch (exception: IOException) {
             logger.debug(
-                tag = LinuxTransportConstants.TAG_RFCOMM_CHANNEL,
+                tag = RfcommChannelConstants.TAG_RFCOMM_CHANNEL,
                 message = "Ignored IOException while closing RFCOMM resource.",
                 context =
                     mapOf(
