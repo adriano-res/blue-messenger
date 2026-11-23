@@ -13,6 +13,7 @@ import com.bluemessenger.domain.ports.transport.constants.TransportConstants
 import com.bluemessenger.domain.ports.transport.model.AckPacket
 import com.bluemessenger.domain.ports.transport.model.EncryptedPayloadPacket
 import com.bluemessenger.domain.ports.transport.model.HandshakePacket
+import com.bluemessenger.domain.ports.transport.model.IncomingPeerConnection
 import com.bluemessenger.domain.ports.transport.model.KeepAlivePacket
 import com.bluemessenger.domain.ports.transport.model.Packet
 import com.bluemessenger.domain.primitives.BluetoothAddress
@@ -43,9 +44,11 @@ import org.freedesktop.dbus.FileDescriptor
 import org.freedesktop.dbus.errors.AccessDenied
 import org.freedesktop.dbus.exceptions.DBusException
 import org.freedesktop.dbus.exceptions.DBusExecutionException
+import org.freedesktop.dbus.exceptions.InvalidBusNameException
 import org.freedesktop.dbus.interfaces.ObjectManager
 import org.freedesktop.dbus.interfaces.Properties
 import org.freedesktop.dbus.types.Variant
+import org.freedesktop.dbus.utils.DBusObjects
 import java.io.Closeable
 import java.io.FilterOutputStream
 import java.io.IOException
@@ -61,6 +64,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
+@Suppress("LargeClass")
 class LinuxBluezTransportTest {
     private val dispatchers =
         CoroutineDispatchers(
@@ -393,7 +397,7 @@ class LinuxBluezTransportTest {
         }
 
     @Test
-    fun scannerAdvertisesAndUnregistersProfile() =
+    fun scannerAdvertisesDiscoverabilityAndValidatesBlankNickname() =
         runBlocking {
             val logger = RecordingAppLogger()
             val fakeClient = FakeBluezDbusClient(adapterPowered = true)
@@ -405,12 +409,159 @@ class LinuxBluezTransportTest {
 
             assertTrue(scanner.startAdvertising("LinuxDesktop").isSuccess)
             assertTrue(scanner.isAdvertising.value)
-            assertEquals(
-                TransportConstants.CANONICAL_SERVICE_UUID,
-                fakeClient.registeredProfiles[BluezDbusConstants.LOCAL_SCANNER_PROFILE_PATH],
-            )
+            assertEquals("LinuxDesktop", fakeClient.adapterAlias)
+            assertTrue(fakeClient.adapterDiscoverable)
+            assertTrue(fakeClient.registeredProfiles.isEmpty())
+
             assertTrue(scanner.stopAdvertising().isSuccess)
             assertFalse(scanner.isAdvertising.value)
+            assertFalse(fakeClient.adapterDiscoverable)
+            scanner.close()
+        }
+
+    @Test
+    fun scannerSurfacesPairedOrInRangeDevicesAndPrioritizesCanonicalUuidPeers() =
+        runBlocking {
+            val logger = RecordingAppLogger()
+            val fakeClient = FakeBluezDbusClient(adapterPowered = true)
+            val scanner = createScanner(fakeClient, logger)
+
+            assertTrue(scanner.startDiscovery().isSuccess)
+
+            fakeClient.emitInterfacesAdded(
+                objectPath = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_01",
+                interfaces =
+                    deviceInterfaces(
+                        address = "aa:bb:cc:dd:ee:01",
+                        alias = "AndroidPhone",
+                        uuids = emptyList(),
+                        rssi = (-52).toShort(),
+                    ),
+            )
+            fakeClient.emitInterfacesAdded(
+                objectPath = "/org/bluez/hci0/dev_11_22_33_44_55_66",
+                interfaces =
+                    deviceInterfaces(
+                        address = "11:22:33:44:55:66",
+                        alias = "StaleDevice",
+                        uuids = listOf("0000110b-0000-1000-8000-00805f9b34fb"),
+                    ),
+            )
+            fakeClient.emitInterfacesAdded(
+                objectPath = "/org/bluez/hci0/dev_54_AB_32_11_22_33",
+                interfaces =
+                    deviceInterfaces(
+                        address = "54:ab:32:11:22:33",
+                        alias = "54-AB-32-11-22-33",
+                        uuids = emptyList(),
+                        rssi = (-70).toShort(),
+                    ),
+            )
+            fakeClient.emitInterfacesAdded(
+                objectPath = "/org/bluez/hci0/dev_22_33_44_55_66_77",
+                interfaces =
+                    deviceInterfaces(
+                        address = "22:33:44:55:66:77",
+                        alias = "ZetaCanonicalPeer",
+                        uuids = listOf(TransportConstants.CANONICAL_SERVICE_UUID),
+                    ),
+            )
+
+            assertEquals(
+                listOf("ZetaCanonicalPeer", "AndroidPhone"),
+                scanner.discoveredPeers.value.map { it.nickname },
+            )
+            assertTrue(scanner.stopDiscovery().isSuccess)
+            scanner.close()
+        }
+
+    @Test
+    fun bluezSignalSourceValidationRequiresUniqueConnectionIdForDbusSignalRules() {
+        val resolvedOwner = BluezDbusClient.validateBluezSignalSource(":1.42")
+        assertEquals(":1.42", resolvedOwner)
+
+        DBusObjects.requireDBusSignalRule(ObjectManager.InterfacesAdded::class.java, resolvedOwner)
+        DBusObjects.requireDBusSignalRule(ObjectManager.InterfacesRemoved::class.java, resolvedOwner)
+        DBusObjects.requireDBusSignalRule(Properties.PropertiesChanged::class.java, resolvedOwner)
+
+        assertFailsWith<DBusException> {
+            BluezDbusClient.validateBluezSignalSource(BluezDbusConstants.BLUEZ_BUS_NAME)
+        }
+        assertFailsWith<DBusException> {
+            BluezDbusClient.validateBluezSignalSource(null)
+        }
+        assertFailsWith<DBusException> {
+            BluezDbusClient.validateBluezSignalSource("   ")
+        }
+        assertFailsWith<InvalidBusNameException> {
+            DBusObjects.requireDBusSignalRule(
+                ObjectManager.InterfacesAdded::class.java,
+                BluezDbusConstants.BLUEZ_BUS_NAME,
+            )
+        }
+    }
+
+    @Test
+    fun scannerTracksMultipleDevicesBySignalSourcePathAndMergesPropertiesChanged() =
+        runBlocking {
+            val logger = RecordingAppLogger()
+            val fakeClient = FakeBluezDbusClient(adapterPowered = true)
+            val scanner = createScanner(fakeClient, logger)
+
+            assertTrue(scanner.startDiscovery().isSuccess)
+
+            val firstDevicePath = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF"
+            val secondDevicePath = "/org/bluez/hci0/dev_22_33_44_55_66_77"
+            val unrelatedDevicePath = "/org/bluez/hci0/dev_99_99_99_99_99_99"
+
+            fakeClient.emitInterfacesAdded(
+                objectPath = firstDevicePath,
+                interfaces =
+                    deviceInterfacesWithoutUuids(
+                        address = "aa:bb:cc:dd:ee:ff",
+                        alias = "PeerOne",
+                    ),
+            )
+            assertTrue(scanner.discoveredPeers.value.isEmpty())
+
+            fakeClient.emitInterfacesAdded(
+                objectPath = secondDevicePath,
+                interfaces =
+                    deviceInterfaces(
+                        address = "22:33:44:55:66:77",
+                        alias = "PeerTwo",
+                        uuids = listOf(TransportConstants.CANONICAL_SERVICE_UUID),
+                    ),
+            )
+            assertEquals(listOf("PeerTwo"), scanner.discoveredPeers.value.map { it.nickname })
+
+            fakeClient.emitPropertiesChanged(
+                objectPath = firstDevicePath,
+                interfaceName = BluezDbusConstants.DEVICE1_INTERFACE,
+                propertiesChanged =
+                    mapOf(
+                        BluezDbusConstants.PROPERTY_UUIDS to
+                            Variant(
+                                listOf(TransportConstants.CANONICAL_SERVICE_UUID),
+                                BluezDbusConstants.DBUS_STRING_ARRAY_SIGNATURE,
+                            ),
+                    ),
+            )
+            assertEquals(listOf("PeerOne", "PeerTwo"), scanner.discoveredPeers.value.map { it.nickname })
+
+            fakeClient.emitInterfacesRemoved(
+                objectPath = unrelatedDevicePath,
+                interfaces = listOf(BluezDbusConstants.DEVICE1_INTERFACE),
+            )
+            assertEquals(listOf("PeerOne", "PeerTwo"), scanner.discoveredPeers.value.map { it.nickname })
+
+            fakeClient.emitInterfacesRemoved(
+                objectPath = secondDevicePath,
+                interfaces = listOf(BluezDbusConstants.DEVICE1_INTERFACE),
+            )
+            assertEquals(listOf("PeerOne"), scanner.discoveredPeers.value.map { it.nickname })
+
+            assertTrue(scanner.stopDiscovery().isSuccess)
             scanner.close()
         }
 
@@ -426,20 +577,174 @@ class LinuxBluezTransportTest {
             clock = { Instant(1_700_000_000_123L) },
         )
 
-    private fun deviceInterfaces(
+    private fun deviceInterfacesWithoutUuids(
         address: String,
         alias: String,
-        uuids: List<String>,
     ): Map<String, Map<String, Variant<*>>> =
         mapOf(
             BluezDbusConstants.DEVICE1_INTERFACE to
                 mapOf(
                     BluezDbusConstants.PROPERTY_ADDRESS to Variant(address),
                     BluezDbusConstants.PROPERTY_ALIAS to Variant(alias),
-                    BluezDbusConstants.PROPERTY_UUIDS to
-                        Variant(uuids, BluezDbusConstants.DBUS_STRING_ARRAY_SIGNATURE),
                 ),
         )
+
+    private fun deviceInterfaces(
+        address: String,
+        alias: String,
+        uuids: List<String>,
+        rssi: Short? = null,
+    ): Map<String, Map<String, Variant<*>>> {
+        val props =
+            linkedMapOf<String, Variant<*>>(
+                BluezDbusConstants.PROPERTY_ADDRESS to Variant(address),
+                BluezDbusConstants.PROPERTY_ALIAS to Variant(alias),
+                BluezDbusConstants.PROPERTY_UUIDS to
+                    Variant(uuids, BluezDbusConstants.DBUS_STRING_ARRAY_SIGNATURE),
+            )
+        if (rssi != null) {
+            props[BluezDbusConstants.PROPERTY_RSSI] = Variant(rssi)
+        }
+        return mapOf(BluezDbusConstants.DEVICE1_INTERFACE to props)
+    }
+
+    @Test
+    fun transportEmitsIncomingPeerConnectionOnAcceptedServerChannelAndDeliversEarlyPackets() =
+        runBlocking {
+            val logger = RecordingAppLogger()
+            val (clientChannel, serverChannel) = createLoopbackChannelPair(logger)
+            val devicePath = "/org/bluez/hci0/dev_CC_DD_EE_FF_00_11"
+
+            val serverDbusClient =
+                FakeBluezDbusClient(
+                    adapterPowered = true,
+                    rfcommChannelFactory = { serverChannel },
+                ).apply {
+                    managedDevices[devicePath] =
+                        mapOf(
+                            BluezDbusConstants.PROPERTY_ADDRESS to Variant("CC:DD:EE:FF:00:11"),
+                            BluezDbusConstants.PROPERTY_ALIAS to Variant("PixelPhone"),
+                        )
+                }
+            val serverTransport =
+                LinuxBluetoothTransportImpl(
+                    bluezClient = serverDbusClient,
+                    permissionChecker = LinuxBluetoothPermissionChecker(serverDbusClient, dispatchers, logger),
+                    dispatchers = dispatchers,
+                    logger = logger,
+                )
+
+            assertTrue(serverTransport.startServer().isSuccess)
+            assertTrue(serverTransport.startServer().isSuccess)
+            serverDbusClient.triggerNewConnection(
+                objectPath = BluezDbusConstants.LOCAL_TRANSPORT_PROFILE_PATH,
+                devicePath = devicePath,
+            )
+
+            val earlyHandshake = HandshakePacket(step = 1, payload = byteArrayOf(4, 5, 6))
+            assertTrue(clientChannel.send(earlyHandshake).isSuccess)
+
+            val acceptedConnection = withTimeout(3_000L) { serverTransport.incomingConnections.first() }
+            assertEquals(
+                IncomingPeerConnection(
+                    address = BluetoothAddress("CC:DD:EE:FF:00:11"),
+                    name = "PixelPhone",
+                ),
+                acceptedConnection,
+            )
+            val receivedPacket = withTimeout(3_000L) { serverTransport.incomingPackets.first() }
+            assertEquals(earlyHandshake, receivedPacket)
+
+            clientChannel.close()
+            serverTransport.close()
+        }
+
+    @Test
+    fun transportRefreshesSdpViaDeviceConnectWhenConnectProfileReportsNotAvailable() =
+        runBlocking {
+            val logger = RecordingAppLogger()
+            val (clientChannel, serverChannel) = createLoopbackChannelPair(logger)
+            var connectProfileAttempt = 0
+            val clientDbusClient =
+                FakeBluezDbusClient(
+                    adapterPowered = true,
+                    rfcommChannelFactory = { clientChannel },
+                    onConnectProfile = { _, fake ->
+                        connectProfileAttempt += 1
+                        if (connectProfileAttempt == 1) {
+                            throw DBusExecutionException("org.bluez.Error.NotSupported: br-connection-not-supported")
+                        }
+                        fake.triggerNewConnection(
+                            objectPath = BluezDbusConstants.LOCAL_TRANSPORT_PROFILE_PATH,
+                            devicePath = "/org/bluez/hci0/dev_11_22_33_44_55_66",
+                        )
+                    },
+                )
+            val clientTransport =
+                LinuxBluetoothTransportImpl(
+                    bluezClient = clientDbusClient,
+                    permissionChecker = LinuxBluetoothPermissionChecker(clientDbusClient, dispatchers, logger),
+                    dispatchers = dispatchers,
+                    logger = logger,
+                )
+
+            assertTrue(clientTransport.connect(BluetoothAddress("11:22:33:44:55:66")).isSuccess)
+            assertEquals(1, clientDbusClient.deviceConnectCalls)
+            assertEquals(2, connectProfileAttempt)
+
+            serverChannel.close()
+            clientTransport.close()
+        }
+
+    @Test
+    fun transportFallsBackToCachedDeviceProbeUuidWhenBluezRejectsCanonicalConnectProfile() =
+        runBlocking {
+            val logger = RecordingAppLogger()
+            val (clientChannel, serverChannel) = createLoopbackChannelPair(logger)
+            val devicePath = "/org/bluez/hci0/dev_11_22_33_44_55_66"
+            val fallbackUuid = "00001200-0000-1000-8000-00805f9b34fb"
+            val requestedUuids = mutableListOf<String>()
+            val clientDbusClient =
+                FakeBluezDbusClient(
+                    adapterPowered = true,
+                    rfcommChannelFactory = { clientChannel },
+                    onConnectProfile = { uuid, fake ->
+                        requestedUuids.add(uuid)
+                        if (uuid == TransportConstants.CANONICAL_SERVICE_UUID) {
+                            throw DBusExecutionException("org.bluez.Error.NotSupported: br-connection-not-supported")
+                        }
+                        fake.triggerNewConnection(
+                            objectPath = BluezDbusConstants.LOCAL_TRANSPORT_PROFILE_PATH,
+                            devicePath = devicePath,
+                        )
+                    },
+                ).apply {
+                    managedDevices[devicePath] =
+                        mapOf(
+                            BluezDbusConstants.PROPERTY_ADDRESS to Variant("11:22:33:44:55:66"),
+                            BluezDbusConstants.PROPERTY_ALIAS to Variant("PairedAndroid"),
+                            BluezDbusConstants.PROPERTY_UUIDS to
+                                Variant(listOf(fallbackUuid), BluezDbusConstants.DBUS_STRING_ARRAY_SIGNATURE),
+                        )
+                }
+            val clientTransport =
+                LinuxBluetoothTransportImpl(
+                    bluezClient = clientDbusClient,
+                    permissionChecker = LinuxBluetoothPermissionChecker(clientDbusClient, dispatchers, logger),
+                    dispatchers = dispatchers,
+                    logger = logger,
+                )
+
+            assertTrue(clientTransport.connect(BluetoothAddress("11:22:33:44:55:66")).isSuccess)
+            assertEquals(listOf(TransportConstants.CANONICAL_SERVICE_UUID, fallbackUuid), requestedUuids)
+            assertEquals(
+                fallbackUuid,
+                clientDbusClient.registeredProfiles[BluezDbusConstants.LOCAL_TRANSPORT_PROFILE_PATH],
+            )
+
+            serverChannel.close()
+            clientTransport.close()
+        }
 
     @Test
     fun transportConnectsInClientAndServerModesOverFakeBluezProfile() =
@@ -580,13 +885,15 @@ class LinuxBluezTransportTest {
         private val onConnectProfile: ((String, FakeBluezDbusClient) -> Unit)? = null,
     ) : BluezDbusClient() {
         var adapterDiscoveryStarted: Boolean = false
+        var deviceConnectCalls: Int = 0
         val registeredProfiles: MutableMap<String, String> = LinkedHashMap()
+        val managedDevices: MutableMap<String, Map<String, Variant<*>>> = LinkedHashMap()
         private val exportedProfiles: MutableMap<String, BluezProfile1> = LinkedHashMap()
         private val interfacesAddedHandlers: MutableList<(ObjectManager.InterfacesAdded) -> Unit> = mutableListOf()
         private val interfacesRemovedHandlers: MutableList<(ObjectManager.InterfacesRemoved) -> Unit> = mutableListOf()
         private val propertiesChangedHandlers: MutableList<(Properties.PropertiesChanged) -> Unit> = mutableListOf()
-        private var adapterAlias: String = "BlueMessenger"
-        private var adapterDiscoverable: Boolean = false
+        var adapterAlias: String = "BlueMessenger"
+        var adapterDiscoverable: Boolean = false
 
         override fun ensureConnected() {
             onConnect?.invoke()
@@ -602,13 +909,18 @@ class LinuxBluezTransportTest {
                     if (!includeAdapter) {
                         emptyMap()
                     } else {
-                        mapOf(
-                            DBusPath(BluezDbusConstants.DEFAULT_ADAPTER_PATH) to
+                        buildMap {
+                            put(
+                                DBusPath(BluezDbusConstants.DEFAULT_ADAPTER_PATH),
                                 mapOf(
                                     BluezDbusConstants.ADAPTER1_INTERFACE to
                                         mapOf(BluezDbusConstants.PROPERTY_POWERED to Variant(adapterPowered)),
                                 ),
-                        )
+                            )
+                            for ((devicePath, props) in managedDevices) {
+                                put(DBusPath(devicePath), mapOf(BluezDbusConstants.DEVICE1_INTERFACE to props))
+                            }
+                        }
                     }
             }
 
@@ -667,6 +979,10 @@ class LinuxBluezTransportTest {
                 override fun isRemote(): Boolean = false
 
                 override fun getObjectPath(): String = devicePath
+
+                override fun connect() {
+                    deviceConnectCalls += 1
+                }
 
                 override fun connectProfile(uuid: String) {
                     onConnectProfile?.invoke(uuid, this@FakeBluezDbusClient)
@@ -756,6 +1072,24 @@ class LinuxBluezTransportTest {
                     interfaces,
                 )
             for (handler in interfacesRemovedHandlers.toList()) {
+                handler(signal)
+            }
+        }
+
+        fun emitPropertiesChanged(
+            objectPath: String,
+            interfaceName: String,
+            propertiesChanged: Map<String, Variant<*>>,
+            propertiesRemoved: List<String> = emptyList(),
+        ) {
+            val signal =
+                Properties.PropertiesChanged(
+                    objectPath,
+                    interfaceName,
+                    propertiesChanged,
+                    propertiesRemoved,
+                )
+            for (handler in propertiesChangedHandlers.toList()) {
                 handler(signal)
             }
         }

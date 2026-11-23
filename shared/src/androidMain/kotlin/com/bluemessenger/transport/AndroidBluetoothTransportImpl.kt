@@ -10,6 +10,7 @@ import com.bluemessenger.domain.error.asFailure
 import com.bluemessenger.domain.ports.logging.AppLogger
 import com.bluemessenger.domain.ports.transport.BluetoothTransport
 import com.bluemessenger.domain.ports.transport.constants.TransportConstants
+import com.bluemessenger.domain.ports.transport.model.IncomingPeerConnection
 import com.bluemessenger.domain.ports.transport.model.Packet
 import com.bluemessenger.domain.primitives.BluetoothAddress
 import com.bluemessenger.transport.constants.AndroidTransportConstants
@@ -26,6 +27,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
@@ -95,6 +97,10 @@ class AndroidBluetoothTransportImpl internal constructor(
         MutableSharedFlow(extraBufferCapacity = AndroidTransportConstants.INCOMING_PACKET_BUFFER_CAPACITY)
     override val incomingPackets: Flow<Packet> = _incomingPackets.asSharedFlow()
 
+    private val _incomingConnections: MutableSharedFlow<IncomingPeerConnection> =
+        MutableSharedFlow(extraBufferCapacity = AndroidTransportConstants.INCOMING_CONNECTION_BUFFER_CAPACITY)
+    override val incomingConnections: Flow<IncomingPeerConnection> = _incomingConnections.asSharedFlow()
+
     @Volatile
     private var activeChannel: RfcommSocketChannel? = null
 
@@ -113,6 +119,9 @@ class AndroidBluetoothTransportImpl internal constructor(
                     return@withContext Result.failure(error)
                 }
                 val currentState = _sessionState.value
+                if (currentState == SessionState.ADVERTISING && activeServerSocket != null) {
+                    return@withContext Result.success(Unit)
+                }
                 val advertisingState =
                     currentState.transitionTo(SessionState.ADVERTISING).getOrElse { error ->
                         logger.warn(
@@ -253,13 +262,14 @@ class AndroidBluetoothTransportImpl internal constructor(
 
     private suspend fun acceptIncomingClient(serverHandle: AndroidServerSocketHandle) {
         try {
-            val channel =
+            val acceptedConnection =
                 runInterruptible {
                     serverHandle.accept(dispatchers, logger)
                 }
             releaseAcceptedServerSocket(serverHandle)
-            val accepted = transitionToConnectingAndActivate(channel)
+            val accepted = transitionToConnectingAndActivate(acceptedConnection.channel)
             if (accepted) {
+                emitIncomingPeerConnection(acceptedConnection)
                 logger.info(
                     tag = AndroidTransportConstants.TAG_TRANSPORT,
                     message = "Accepted incoming Android RFCOMM client connection.",
@@ -429,6 +439,7 @@ class AndroidBluetoothTransportImpl internal constructor(
                                 throwable = cause,
                             )
                         }.collect { packet ->
+                            _incomingPackets.subscriptionCount.first { count -> count > 0 }
                             _incomingPackets.emit(packet)
                         }
                 }
@@ -481,6 +492,20 @@ class AndroidBluetoothTransportImpl internal constructor(
         acceptJob?.cancel()
         if (serverHandle != null) {
             closeHandleQuietly(serverHandle)
+        }
+    }
+
+    private fun emitIncomingPeerConnection(acceptedConnection: AcceptedAndroidConnection) {
+        val rawAddress = acceptedConnection.remoteAddress ?: return
+        val remoteAddress = BluetoothAddress.parse(rawAddress).getOrNull() ?: return
+        val incomingPeer =
+            IncomingPeerConnection(
+                address = remoteAddress,
+                name = acceptedConnection.remoteName?.takeIf { it.isNotBlank() },
+            )
+        transportScope.launch {
+            _incomingConnections.subscriptionCount.first { count -> count > 0 }
+            _incomingConnections.emit(incomingPeer)
         }
     }
 

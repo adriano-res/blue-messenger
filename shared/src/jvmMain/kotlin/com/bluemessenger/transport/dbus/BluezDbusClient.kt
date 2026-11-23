@@ -7,12 +7,17 @@ import com.bluemessenger.transport.constants.BluezDbusConstants
 import org.freedesktop.dbus.FileDescriptor
 import org.freedesktop.dbus.connections.impl.DBusConnection
 import org.freedesktop.dbus.connections.impl.DBusConnectionBuilder
+import org.freedesktop.dbus.exceptions.DBusException
 import org.freedesktop.dbus.interfaces.ObjectManager
 import org.freedesktop.dbus.interfaces.Properties
+import org.freedesktop.dbus.messages.DBusSignal
 import org.freedesktop.dbus.transport.junixsocket.JUnixSocketSocketProvider
+import org.freedesktop.dbus.utils.DBusObjects
+import org.newsclub.net.unix.FileDescriptorCast
 import java.io.Closeable
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.nio.channels.SocketChannel
 
 /**
  * System D-Bus client for BlueZ 5 proxies, signal subscriptions, and `SCM_RIGHTS` RFCOMM
@@ -108,34 +113,25 @@ internal open class BluezDbusClient(
     }
 
     /**
-     * Subscribes to `org.freedesktop.DBus.ObjectManager.InterfacesAdded` signals from `org.bluez`.
+     * Subscribes to `org.freedesktop.DBus.ObjectManager.InterfacesAdded` signals using the
+     * resolved unique D-Bus connection name of `org.bluez`.
      */
     open fun addInterfacesAddedHandler(handler: (ObjectManager.InterfacesAdded) -> Unit): AutoCloseable =
-        requireConnection().addSigHandler(
-            ObjectManager.InterfacesAdded::class.java,
-            BluezDbusConstants.BLUEZ_BUS_NAME,
-            handler::invoke,
-        )
+        addBluezSignalHandler(ObjectManager.InterfacesAdded::class.java, handler)
 
     /**
-     * Subscribes to `org.freedesktop.DBus.ObjectManager.InterfacesRemoved` signals from `org.bluez`.
+     * Subscribes to `org.freedesktop.DBus.ObjectManager.InterfacesRemoved` signals using the
+     * resolved unique D-Bus connection name of `org.bluez`.
      */
     open fun addInterfacesRemovedHandler(handler: (ObjectManager.InterfacesRemoved) -> Unit): AutoCloseable =
-        requireConnection().addSigHandler(
-            ObjectManager.InterfacesRemoved::class.java,
-            BluezDbusConstants.BLUEZ_BUS_NAME,
-            handler::invoke,
-        )
+        addBluezSignalHandler(ObjectManager.InterfacesRemoved::class.java, handler)
 
     /**
-     * Subscribes to `org.freedesktop.DBus.Properties.PropertiesChanged` signals from `org.bluez`.
+     * Subscribes to `org.freedesktop.DBus.Properties.PropertiesChanged` signals using the resolved
+     * unique D-Bus connection name of `org.bluez`.
      */
     open fun addPropertiesChangedHandler(handler: (Properties.PropertiesChanged) -> Unit): AutoCloseable =
-        requireConnection().addSigHandler(
-            Properties.PropertiesChanged::class.java,
-            BluezDbusConstants.BLUEZ_BUS_NAME,
-            handler::invoke,
-        )
+        addBluezSignalHandler(Properties.PropertiesChanged::class.java, handler)
 
     /**
      * Converts a BlueZ-supplied [dbusFd] into a bidirectional [RfcommSocketChannel].
@@ -146,6 +142,19 @@ internal open class BluezDbusClient(
         logger: AppLogger,
     ): RfcommSocketChannel {
         val javaFd = dbusFd.toJavaFileDescriptor(socketProvider)
+        val descriptorCast = FileDescriptorCast.using(javaFd)
+        if (descriptorCast.isAvailable(SocketChannel::class.java)) {
+            val socketChannel = descriptorCast.`as`(SocketChannel::class.java)
+            socketChannel.configureBlocking(true)
+            val socket = socketChannel.socket()
+            return RfcommSocketChannel(
+                inputStream = socket.getInputStream(),
+                outputStream = socket.getOutputStream(),
+                closeable = socketChannel,
+                dispatchers = dispatchers,
+                logger = logger,
+            )
+        }
         val inputStream = FileInputStream(javaFd)
         val outputStream = FileOutputStream(javaFd)
         val descriptorCloseable =
@@ -173,12 +182,41 @@ internal open class BluezDbusClient(
         }
     }
 
+    private fun <T : DBusSignal> addBluezSignalHandler(
+        signalType: Class<T>,
+        handler: (T) -> Unit,
+    ): AutoCloseable {
+        val activeConnection = requireConnection()
+        val bluezUniqueName = resolveBluezUniqueName(activeConnection)
+        return activeConnection.addSigHandler(
+            signalType,
+            bluezUniqueName,
+            handler::invoke,
+        )
+    }
+
+    private fun resolveBluezUniqueName(activeConnection: DBusConnection): String =
+        validateBluezSignalSource(
+            activeConnection.getDBusOwnerName(BluezDbusConstants.BLUEZ_BUS_NAME),
+        )
+
     private fun requireConnection(): DBusConnection {
         connection?.let { return it }
         return synchronized(connectionLock) {
             connection ?: connectionProvider().also { created ->
                 connection = created
             }
+        }
+    }
+
+    companion object {
+        fun validateBluezSignalSource(ownerName: String?): String {
+            if (ownerName.isNullOrBlank() || !DBusObjects.validateConnectionId(ownerName)) {
+                throw DBusException(
+                    "Unable to resolve unique D-Bus connection name for '${BluezDbusConstants.BLUEZ_BUS_NAME}'.",
+                )
+            }
+            return ownerName
         }
     }
 }

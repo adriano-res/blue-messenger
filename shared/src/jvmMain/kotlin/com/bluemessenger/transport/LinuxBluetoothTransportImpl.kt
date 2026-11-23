@@ -8,12 +8,14 @@ import com.bluemessenger.domain.error.asFailure
 import com.bluemessenger.domain.ports.logging.AppLogger
 import com.bluemessenger.domain.ports.transport.BluetoothTransport
 import com.bluemessenger.domain.ports.transport.constants.TransportConstants
+import com.bluemessenger.domain.ports.transport.model.IncomingPeerConnection
 import com.bluemessenger.domain.ports.transport.model.Packet
 import com.bluemessenger.domain.primitives.BluetoothAddress
 import com.bluemessenger.transport.constants.BluezDbusConstants
 import com.bluemessenger.transport.constants.LinuxTransportConstants
 import com.bluemessenger.transport.dbus.BluezDbusClient
 import com.bluemessenger.transport.dbus.BluezDbusErrorMapper
+import com.bluemessenger.transport.dbus.BluezDevice1
 import com.bluemessenger.transport.dbus.BluezProfile1
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -29,6 +31,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -38,6 +41,7 @@ import org.freedesktop.dbus.DBusPath
 import org.freedesktop.dbus.FileDescriptor
 import org.freedesktop.dbus.exceptions.DBusException
 import org.freedesktop.dbus.exceptions.DBusExecutionException
+import org.freedesktop.dbus.types.UInt16
 import org.freedesktop.dbus.types.Variant
 import java.io.Closeable
 import java.io.IOException
@@ -55,6 +59,7 @@ import java.io.IOException
  * `BluetoothAdapterDisabledError`, `TransportDisconnectedError`), logs structured warnings/errors
  * without exposing secrets, and always rethrows [CancellationException].
  */
+@Suppress("LargeClass")
 class LinuxBluetoothTransportImpl internal constructor(
     private val bluezClient: BluezDbusClient,
     private val permissionChecker: LinuxBluetoothPermissionChecker,
@@ -97,8 +102,15 @@ class LinuxBluetoothTransportImpl internal constructor(
         MutableSharedFlow(extraBufferCapacity = LinuxTransportConstants.INCOMING_PACKET_BUFFER_CAPACITY)
     override val incomingPackets: Flow<Packet> = _incomingPackets.asSharedFlow()
 
+    private val _incomingConnections: MutableSharedFlow<IncomingPeerConnection> =
+        MutableSharedFlow(extraBufferCapacity = LinuxTransportConstants.INCOMING_CONNECTION_BUFFER_CAPACITY)
+    override val incomingConnections: Flow<IncomingPeerConnection> = _incomingConnections.asSharedFlow()
+
     @Volatile
     private var activeChannel: RfcommSocketChannel? = null
+
+    @Volatile
+    private var activeProfileCallback: TransportProfileCallback? = null
 
     private var activeReaderJob: Job? = null
     private var pendingClientChannel: CompletableDeferred<RfcommSocketChannel>? = null
@@ -117,6 +129,9 @@ class LinuxBluetoothTransportImpl internal constructor(
                         return@withContext Result.failure(error)
                     }
                 val currentState = _sessionState.value
+                if (currentState == SessionState.ADVERTISING && isProfileRegistered) {
+                    return@withContext Result.success(Unit)
+                }
                 val advertisingState =
                     currentState.transitionTo(SessionState.ADVERTISING).getOrElse { error ->
                         logger.warn(
@@ -241,13 +256,14 @@ class LinuxBluetoothTransportImpl internal constructor(
         role: String,
         targetState: SessionState,
         adapterPath: String,
+        profileUuid: String = TransportConstants.CANONICAL_SERVICE_UUID,
     ): Result<Unit> {
         return try {
             ensureProfileExported()
             val options = buildProfileOptions(role)
             bluezClient.profileManager().registerProfile(
                 DBusPath(BluezDbusConstants.LOCAL_TRANSPORT_PROFILE_PATH),
-                TransportConstants.CANONICAL_SERVICE_UUID,
+                profileUuid,
                 options,
             )
             isProfileRegistered = true
@@ -255,7 +271,7 @@ class LinuxBluetoothTransportImpl internal constructor(
             logger.info(
                 tag = LinuxTransportConstants.TAG_TRANSPORT,
                 message = "Registered BlueZ RFCOMM transport profile.",
-                context = mapOf("role" to role, "adapterPath" to adapterPath),
+                context = mapOf("role" to role, "adapterPath" to adapterPath, "profileUuid" to profileUuid),
             )
             Result.success(Unit)
         } catch (cancellation: CancellationException) {
@@ -294,7 +310,7 @@ class LinuxBluetoothTransportImpl internal constructor(
 
         return try {
             val devicePath = resolveDevicePath(adapterPath, address)
-            bluezClient.device(devicePath).connectProfile(TransportConstants.CANONICAL_SERVICE_UUID)
+            connectDeviceProfileWithSdpRefresh(adapterPath, devicePath, deferredChannel)
             val channel =
                 withTimeoutOrNull(connectionTimeoutMs) {
                     deferredChannel.await()
@@ -404,6 +420,7 @@ class LinuxBluetoothTransportImpl internal constructor(
                 _sessionState.value = SessionState.CONNECTING
             }
             activateConnectedChannel(channel)
+            emitIncomingPeerConnection(devicePath)
             logger.info(
                 tag = LinuxTransportConstants.TAG_TRANSPORT,
                 message = "Accepted incoming BlueZ RFCOMM connection.",
@@ -469,6 +486,7 @@ class LinuxBluetoothTransportImpl internal constructor(
                                 throwable = cause,
                             )
                         }.collect { packet ->
+                            _incomingPackets.subscriptionCount.first { count -> count > 0 }
                             _incomingPackets.emit(packet)
                         }
                 }
@@ -508,11 +526,15 @@ class LinuxBluetoothTransportImpl internal constructor(
         }
     }
 
-    private fun handleProfileRelease() {
+    private fun handleProfileRelease(callback: TransportProfileCallback) {
+        if (activeProfileCallback !== callback) {
+            return
+        }
         logger.info(
             tag = LinuxTransportConstants.TAG_TRANSPORT,
             message = "BlueZ released transport profile registration.",
         )
+        activeProfileCallback = null
         isProfileRegistered = false
         closeActiveChannelAndReader()
         if (_sessionState.value != SessionState.DISCONNECTED) {
@@ -535,15 +557,18 @@ class LinuxBluetoothTransportImpl internal constructor(
 
     private fun ensureProfileExported() {
         if (!isProfileExported) {
+            val callback = TransportProfileCallback()
+            activeProfileCallback = callback
             bluezClient.exportProfile(
                 BluezDbusConstants.LOCAL_TRANSPORT_PROFILE_PATH,
-                TransportProfileCallback(),
+                callback,
             )
             isProfileExported = true
         }
     }
 
     private fun cleanupProfileRegistration() {
+        activeProfileCallback = null
         if (isProfileRegistered) {
             isProfileRegistered = false
             try {
@@ -576,6 +601,238 @@ class LinuxBluetoothTransportImpl internal constructor(
         }
     }
 
+    private fun connectDeviceProfileWithSdpRefresh(
+        adapterPath: String,
+        devicePath: String,
+        deferredChannel: CompletableDeferred<RfcommSocketChannel>,
+    ) {
+        val deviceProxy = bluezClient.device(devicePath)
+        try {
+            deviceProxy.connectProfile(TransportConstants.CANONICAL_SERVICE_UUID)
+        } catch (exception: DBusExecutionException) {
+            if (!isMissingProfileOrSdpCacheDetail(exception.message)) {
+                throw exception
+            }
+            logger.info(
+                tag = LinuxTransportConstants.TAG_TRANSPORT,
+                message = "BlueZ ConnectProfile needed SDP fallback; trying probe UUIDs and SDP refresh.",
+                context = mapOf("devicePath" to devicePath),
+            )
+            if (tryConnectViaFallbackProbeUuids(adapterPath, devicePath, deviceProxy, deferredChannel)) {
+                return
+            }
+            refreshRemoteSdpRecords(deviceProxy, devicePath)
+            if (!deferredChannel.isCompleted &&
+                !tryConnectViaFallbackProbeUuids(adapterPath, devicePath, deviceProxy, deferredChannel)
+            ) {
+                retryConnectProfileAfterSdpRefresh(
+                    deviceProxy = deviceProxy,
+                    profileUuid = TransportConstants.CANONICAL_SERVICE_UUID,
+                    deferredChannel = deferredChannel,
+                )
+            }
+        }
+    }
+
+    private fun tryConnectViaFallbackProbeUuids(
+        adapterPath: String,
+        devicePath: String,
+        deviceProxy: BluezDevice1,
+        deferredChannel: CompletableDeferred<RfcommSocketChannel>,
+    ): Boolean {
+        val candidateUuids = selectFallbackProbeUuids(devicePath)
+        val connected =
+            candidateUuids.any { probeUuid ->
+                if (deferredChannel.isCompleted) {
+                    true
+                } else {
+                    cleanupProfileRegistration()
+                    val registered =
+                        registerTransportProfile(
+                            role = BluezDbusConstants.PROFILE_ROLE_CLIENT,
+                            targetState = SessionState.CONNECTING,
+                            adapterPath = adapterPath,
+                            profileUuid = probeUuid,
+                        )
+                    registered.isSuccess && attemptConnectProfileWithUuid(deviceProxy, probeUuid, deferredChannel)
+                }
+            }
+        if (!connected && candidateUuids.isNotEmpty() && !deferredChannel.isCompleted) {
+            cleanupProfileRegistration()
+            registerTransportProfile(
+                role = BluezDbusConstants.PROFILE_ROLE_CLIENT,
+                targetState = SessionState.CONNECTING,
+                adapterPath = adapterPath,
+                profileUuid = TransportConstants.CANONICAL_SERVICE_UUID,
+            )
+        }
+        return connected || deferredChannel.isCompleted
+    }
+
+    private fun attemptConnectProfileWithUuid(
+        deviceProxy: BluezDevice1,
+        profileUuid: String,
+        deferredChannel: CompletableDeferred<RfcommSocketChannel>,
+    ): Boolean =
+        try {
+            deviceProxy.connectProfile(profileUuid)
+            true
+        } catch (exception: DBusExecutionException) {
+            deferredChannel.isCompleted || isAlreadyConnectedOrInProgressDetail(exception.message)
+        }
+
+    private fun selectFallbackProbeUuids(devicePath: String): List<String> {
+        val rawUuids =
+            when (val value = loadDevicePropertiesOrNull(devicePath)?.get(BluezDbusConstants.PROPERTY_UUIDS)?.value) {
+                is Collection<*> -> value.filterIsInstance<String>()
+                is Array<*> -> value.filterIsInstance<String>()
+                else -> emptyList()
+            }
+        if (rawUuids.isEmpty()) {
+            return emptyList()
+        }
+        val preferred =
+            BluezDbusConstants.PREFERRED_FALLBACK_PROBE_UUIDS.filter { candidate ->
+                rawUuids.any { existing -> existing.equals(candidate, ignoreCase = true) }
+            }
+        val remaining =
+            rawUuids.filter { existing ->
+                !existing.equals(TransportConstants.CANONICAL_SERVICE_UUID, ignoreCase = true) &&
+                    preferred.none { pref -> pref.equals(existing, ignoreCase = true) }
+            }
+        return preferred + remaining
+    }
+
+    private fun retryConnectProfileAfterSdpRefresh(
+        deviceProxy: BluezDevice1,
+        profileUuid: String,
+        deferredChannel: CompletableDeferred<RfcommSocketChannel>,
+    ) {
+        try {
+            deviceProxy.connectProfile(profileUuid)
+        } catch (retryException: DBusExecutionException) {
+            val alreadyConnecting =
+                deferredChannel.isCompleted ||
+                    isAlreadyConnectedOrInProgressDetail(retryException.message)
+            if (!alreadyConnecting) {
+                throw retryException
+            }
+        }
+    }
+
+    private fun refreshRemoteSdpRecords(
+        deviceProxy: BluezDevice1,
+        devicePath: String,
+    ) {
+        disconnectStaleAclLinkQuietly(deviceProxy, devicePath)
+        try {
+            deviceProxy.connect()
+        } catch (connectException: DBusExecutionException) {
+            if (!isAlreadyConnectedOrInProgressDetail(connectException.message)) {
+                logger.debug(
+                    tag = LinuxTransportConstants.TAG_TRANSPORT,
+                    message = "BlueZ Device1.Connect() during SDP refresh reported failure.",
+                    context =
+                        mapOf(
+                            "devicePath" to devicePath,
+                            "reason" to (connectException.message ?: "unknown"),
+                        ),
+                )
+            }
+        }
+    }
+
+    private fun disconnectStaleAclLinkQuietly(
+        deviceProxy: BluezDevice1,
+        devicePath: String,
+    ) {
+        try {
+            deviceProxy.disconnect()
+        } catch (disconnectException: DBusExecutionException) {
+            logger.debug(
+                tag = LinuxTransportConstants.TAG_TRANSPORT,
+                message = "BlueZ Device1.Disconnect() before SDP refresh completed.",
+                context =
+                    mapOf(
+                        "devicePath" to devicePath,
+                        "reason" to (disconnectException.message ?: "not_connected"),
+                    ),
+            )
+        }
+    }
+
+    private fun isMissingProfileOrSdpCacheDetail(message: String?): Boolean =
+        message?.contains(BluezDbusConstants.ERROR_TOKEN_NOT_AVAILABLE, ignoreCase = true) == true ||
+            message?.contains(BluezDbusConstants.ERROR_TOKEN_NOT_SUPPORTED, ignoreCase = true) == true ||
+            message?.contains(BluezDbusConstants.ERROR_TOKEN_CONNECTION_NOT_SUPPORTED, ignoreCase = true) == true
+
+    private fun isAlreadyConnectedOrInProgressDetail(message: String?): Boolean =
+        message?.contains(BluezDbusConstants.ERROR_TOKEN_ALREADY_CONNECTED, ignoreCase = true) == true ||
+            message?.contains(BluezDbusConstants.ERROR_TOKEN_IN_PROGRESS, ignoreCase = true) == true
+
+    private fun emitIncomingPeerConnection(devicePath: String) {
+        transportScope.launch {
+            val incomingPeer = resolveIncomingPeerConnection(devicePath) ?: return@launch
+            _incomingConnections.subscriptionCount.first { count -> count > 0 }
+            _incomingConnections.emit(incomingPeer)
+        }
+    }
+
+    private fun resolveIncomingPeerConnection(devicePath: String): IncomingPeerConnection? {
+        val deviceProps = loadDevicePropertiesOrNull(devicePath)
+        val addressFromProps =
+            (deviceProps?.get(BluezDbusConstants.PROPERTY_ADDRESS)?.value as? String)
+                ?.let { raw -> BluetoothAddress.parse(raw).getOrNull() }
+        val resolvedAddress = addressFromProps ?: parseAddressFromDevicePath(devicePath) ?: return null
+        val remoteName =
+            (deviceProps?.get(BluezDbusConstants.PROPERTY_ALIAS)?.value as? String)
+                ?.takeIf { it.isNotBlank() }
+                ?: (deviceProps?.get(BluezDbusConstants.PROPERTY_NAME)?.value as? String)
+                    ?.takeIf { it.isNotBlank() }
+        return IncomingPeerConnection(address = resolvedAddress, name = remoteName)
+    }
+
+    private fun loadDevicePropertiesOrNull(devicePath: String): Map<String, Variant<*>>? =
+        try {
+            bluezClient.objectManager()
+                .GetManagedObjects()[DBusPath(devicePath)]
+                ?.get(BluezDbusConstants.DEVICE1_INTERFACE)
+        } catch (exception: DBusException) {
+            logger.debug(
+                tag = LinuxTransportConstants.TAG_TRANSPORT,
+                message = "Unable to query BlueZ ObjectManager for incoming device metadata.",
+                context = mapOf("devicePath" to devicePath, "reason" to (exception.message ?: "unknown")),
+            )
+            null
+        } catch (exception: DBusExecutionException) {
+            logger.debug(
+                tag = LinuxTransportConstants.TAG_TRANSPORT,
+                message = "Unable to query BlueZ ObjectManager for incoming device metadata.",
+                context = mapOf("devicePath" to devicePath, "reason" to (exception.message ?: "unknown")),
+            )
+            null
+        } catch (exception: IOException) {
+            logger.debug(
+                tag = LinuxTransportConstants.TAG_TRANSPORT,
+                message = "Unable to query BlueZ ObjectManager for incoming device metadata.",
+                context = mapOf("devicePath" to devicePath, "reason" to (exception.message ?: "unknown")),
+            )
+            null
+        }
+
+    private fun parseAddressFromDevicePath(devicePath: String): BluetoothAddress? {
+        val suffix = devicePath.substringAfterLast("/${LinuxTransportConstants.BLUEZ_DEVICE_PATH_PREFIX}", "")
+        if (suffix.isBlank()) {
+            return null
+        }
+        val candidate =
+            suffix.replace(
+                LinuxTransportConstants.MAC_UNDERSCORE_CHAR,
+                LinuxTransportConstants.MAC_COLON_CHAR,
+            )
+        return BluetoothAddress.parse(candidate).getOrNull()
+    }
+
     private fun resolveDevicePath(
         adapterPath: String,
         address: BluetoothAddress,
@@ -598,14 +855,23 @@ class LinuxBluetoothTransportImpl internal constructor(
         return "$adapterPath/${LinuxTransportConstants.BLUEZ_DEVICE_PATH_PREFIX}$formattedMac"
     }
 
-    private fun buildProfileOptions(role: String): Map<String, Variant<*>> =
-        mapOf(
+    private fun buildProfileOptions(role: String): Map<String, Variant<*>> {
+        val rfcommChannel =
+            if (role == BluezDbusConstants.PROFILE_ROLE_SERVER) {
+                LinuxTransportConstants.RFCOMM_SERVER_CHANNEL
+            } else {
+                LinuxTransportConstants.RFCOMM_AUTO_CHANNEL
+            }
+        return mapOf(
             BluezDbusConstants.PROFILE_OPTION_NAME to Variant(BluezDbusConstants.PROFILE_NAME_BLUE_MESSENGER),
             BluezDbusConstants.PROFILE_OPTION_ROLE to Variant(role),
             BluezDbusConstants.PROFILE_OPTION_SERVICE to Variant(TransportConstants.CANONICAL_SERVICE_UUID),
+            BluezDbusConstants.PROFILE_OPTION_CHANNEL to Variant(UInt16(rfcommChannel)),
+            BluezDbusConstants.PROFILE_OPTION_AUTO_CONNECT to Variant(true),
             BluezDbusConstants.PROFILE_OPTION_REQUIRE_AUTHENTICATION to Variant(false),
             BluezDbusConstants.PROFILE_OPTION_REQUIRE_AUTHORIZATION to Variant(false),
         )
+    }
 
     @OptIn(ExperimentalCoroutinesApi::class)
     private fun clearPendingClientChannel(deferredChannel: CompletableDeferred<RfcommSocketChannel>) {
@@ -642,7 +908,7 @@ class LinuxBluetoothTransportImpl internal constructor(
         override fun getObjectPath(): String = BluezDbusConstants.LOCAL_TRANSPORT_PROFILE_PATH
 
         override fun release() {
-            handleProfileRelease()
+            handleProfileRelease(this)
         }
 
         override fun newConnection(

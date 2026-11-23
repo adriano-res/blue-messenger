@@ -20,6 +20,9 @@ internal object BluezDbusConstants {
     const val PROPERTY_ALIAS: String = "Alias"
     const val PROPERTY_UUIDS: String = "UUIDs"
     const val PROPERTY_DISCOVERABLE: String = "Discoverable"
+    const val PROPERTY_PAIRED: String = "Paired"
+    const val PROPERTY_CONNECTED: String = "Connected"
+    const val PROPERTY_RSSI: String = "RSSI"
 
     const val DISCOVERY_FILTER_UUIDS: String = "UUIDs"
     const val DISCOVERY_FILTER_TRANSPORT: String = "Transport"
@@ -29,6 +32,8 @@ internal object BluezDbusConstants {
     const val PROFILE_OPTION_ROLE: String = "Role"
     const val PROFILE_OPTION_NAME: String = "Name"
     const val PROFILE_OPTION_SERVICE: String = "Service"
+    const val PROFILE_OPTION_CHANNEL: String = "Channel"
+    const val PROFILE_OPTION_AUTO_CONNECT: String = "AutoConnect"
     const val PROFILE_OPTION_REQUIRE_AUTHENTICATION: String = "RequireAuthentication"
     const val PROFILE_OPTION_REQUIRE_AUTHORIZATION: String = "RequireAuthorization"
     const val PROFILE_ROLE_SERVER: String = "server"
@@ -44,4 +49,20 @@ internal object BluezDbusConstants {
     const val ERROR_TOKEN_PERMISSION: String = "Permission"
     const val ERROR_TOKEN_NOT_READY: String = "NotReady"
     const val ERROR_TOKEN_NOT_POWERED: String = "NotPowered"
+    const val ERROR_TOKEN_NOT_AVAILABLE: String = "NotAvailable"
+    const val ERROR_TOKEN_NOT_SUPPORTED: String = "NotSupported"
+    const val ERROR_TOKEN_CONNECTION_NOT_SUPPORTED: String = "connection-not-supported"
+    const val ERROR_TOKEN_ALREADY_CONNECTED: String = "AlreadyConnected"
+    const val ERROR_TOKEN_IN_PROGRESS: String = "InProgress"
+    const val ERROR_TOKEN_NOT_CONNECTED: String = "NotConnected"
+
+    val PREFERRED_FALLBACK_PROBE_UUIDS: List<String> =
+        listOf(
+            "00001200-0000-1000-8000-00805f9b34fb",
+            "00001800-0000-1000-8000-00805f9b34fb",
+            "00001801-0000-1000-8000-00805f9b34fb",
+            "00001105-0000-1000-8000-00805f9b34fb",
+            "0000112f-0000-1000-8000-00805f9b34fb",
+            "00001132-0000-1000-8000-00805f9b34fb",
+        )
 }

@@ -2,10 +2,12 @@ package com.bluemessenger.domain.ports.transport
 
 import com.bluemessenger.domain.enums.SessionState
 import com.bluemessenger.domain.error.DomainException
+import com.bluemessenger.domain.ports.transport.model.IncomingPeerConnection
 import com.bluemessenger.domain.ports.transport.model.Packet
 import com.bluemessenger.domain.primitives.BluetoothAddress
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.emptyFlow
 
 /**
  * Platform-agnostic bidirectional Bluetooth RFCOMM/L2CAP transport port exchanging typed [Packet]
@@ -34,6 +36,12 @@ interface BluetoothTransport {
      * Stream of decoded incoming [Packet] values received from the active Bluetooth link.
      */
     val incomingPackets: Flow<Packet>
+
+    /**
+     * Stream of accepted inbound peer connections ready for responder handshake negotiation.
+     */
+    val incomingConnections: Flow<IncomingPeerConnection>
+        get() = emptyFlow()
 
     /**
      * Opens a server socket listening on `TransportConstants.CANONICAL_SERVICE_UUID` for incoming

@@ -3,6 +3,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
 }
 
 android {
@@ -15,6 +16,10 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0.0"
+    }
+
+    buildFeatures {
+        compose = true
     }
 
     compileOptions {
@@ -31,4 +36,7 @@ kotlin {
 
 dependencies {
     implementation(project(":shared"))
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.kotlinx.coroutines.android)
+    testImplementation(kotlin("test"))
 }

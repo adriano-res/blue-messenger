@@ -5,6 +5,7 @@ import com.bluemessenger.domain.enums.SessionState
 import com.bluemessenger.domain.model.Conversation
 import com.bluemessenger.domain.model.Peer
 import com.bluemessenger.domain.ports.logging.AppLogger
+import com.bluemessenger.domain.primitives.BluetoothAddress
 import com.bluemessenger.domain.primitives.ConversationId
 import com.bluemessenger.domain.primitives.MessageId
 import com.bluemessenger.domain.primitives.PeerId
@@ -14,6 +15,7 @@ import com.bluemessenger.domain.usecase.message.ObserveMessagesUseCase
 import com.bluemessenger.domain.usecase.message.SendMessageUseCase
 import com.bluemessenger.domain.usecase.peer.ObserveConversationsUseCase
 import com.bluemessenger.domain.usecase.peer.VerifyPeerSafetyNumberUseCase
+import com.bluemessenger.domain.usecase.session.AcceptIncomingSessionsUseCase
 import com.bluemessenger.domain.usecase.session.EstablishSecureSessionUseCase
 import com.bluemessenger.domain.usecase.session.ManageKeepAliveAndReconnectUseCase
 import com.bluemessenger.presentation.PresentationError
@@ -61,6 +63,7 @@ class ChatViewModel(
     private val dispatchers: CoroutineDispatchers,
     private val logger: AppLogger,
     private val scope: CoroutineScope = createPresentationScope(dispatchers),
+    private val acceptIncomingSessionsUseCase: AcceptIncomingSessionsUseCase? = null,
 ) {
     private val mutableUiState: MutableStateFlow<ChatUiState> = MutableStateFlow(ChatUiState())
 
@@ -69,6 +72,7 @@ class ChatViewModel(
      */
     val uiState: StateFlow<ChatUiState> = mutableUiState.asStateFlow()
 
+    private var incomingSessionsJob: Job? = null
     private var peerScope: CoroutineScope? = null
     private var conversationObservationJob: Job? = null
     private var messagesObservationJob: Job? = null
@@ -80,6 +84,13 @@ class ChatViewModel(
     private var activeSessionScope: CoroutineScope? = null
     private var activeSessionConversationId: ConversationId? = null
     private var wasSessionActive: Boolean = false
+
+    init {
+        incomingSessionsJob =
+            acceptIncomingSessionsUseCase?.observeIncomingSessions(scope = scope) { acceptedConversation ->
+                handleIncomingSessionEstablished(acceptedConversation)
+            }
+    }
 
     /**
      * Dispatches a [ChatIntent] from the UI layer.
@@ -104,9 +115,41 @@ class ChatViewModel(
      * managed ViewModel [CoroutineScope].
      */
     fun clear() {
+        incomingSessionsJob?.cancel()
+        incomingSessionsJob = null
         cancelPeerScope()
         cancelActiveSessionJobs()
         scope.cancel()
+    }
+
+    private suspend fun handleIncomingSessionEstablished(conversation: Conversation) {
+        withContext(dispatchers.main) {
+            val currentPeer = mutableUiState.value.peer
+            val matchesCurrentPeer =
+                currentPeer != null &&
+                    (currentPeer.id == conversation.peer.id || currentPeer.address == conversation.peer.address)
+            when {
+                currentPeer == null -> openEstablishedIncomingConversation(conversation)
+                matchesCurrentPeer -> applyConversationSnapshot(conversation)
+                else -> startActiveSessionLoops(conversation)
+            }
+        }
+    }
+
+    private fun openEstablishedIncomingConversation(conversation: Conversation) {
+        cancelPeerScope()
+        cancelActiveSessionJobs()
+        peerScope = createChildScope(dispatchers.main)
+        mutableUiState.value =
+            ChatUiState(
+                peer = conversation.peer,
+                conversationId = conversation.id,
+                sessionState = conversation.state,
+                isConnecting = false,
+            )
+        startActiveSessionLoops(conversation)
+        ensureMessagesObserved(conversation.id)
+        observePeerConversation(conversation.peer.id, conversation.peer.address)
     }
 
     private fun openPeer(
@@ -115,7 +158,8 @@ class ChatViewModel(
         sessionState: SessionState,
     ) {
         val current = mutableUiState.value
-        if (current.peer?.id == peer.id) {
+        val samePeer = current.peer?.id == peer.id || current.peer?.address == peer.address
+        if (samePeer) {
             val resolvedConvId = current.conversationId ?: conversationId
             if (resolvedConvId != null && observedConversationId != resolvedConvId) {
                 mutableUiState.update { it.copy(conversationId = resolvedConvId) }
@@ -146,10 +190,13 @@ class ChatViewModel(
                 )
             }
         }
-        observePeerConversation(peer.id)
+        observePeerConversation(peer.id, peer.address)
     }
 
-    private fun observePeerConversation(peerId: PeerId) {
+    private fun observePeerConversation(
+        peerId: PeerId,
+        peerAddress: BluetoothAddress,
+    ) {
         conversationObservationJob =
             requirePeerScope().launch {
                 observeConversationsUseCase()
@@ -161,15 +208,21 @@ class ChatViewModel(
                             throwable = cause,
                             context = mapOf("peerId" to peerId.toString()),
                         )
-                        updateStateForPeer(peerId) { it.copy(error = cause.toPresentationError()) }
+                        updateStateForPeer(peerId, peerAddress) { it.copy(error = cause.toPresentationError()) }
                     }.collect { conversations ->
-                        conversations.firstOrNull { it.peer.id == peerId }?.let(::applyConversationSnapshot)
+                        conversations
+                            .firstOrNull { it.peer.id == peerId || it.peer.address == peerAddress }
+                            ?.let(::applyConversationSnapshot)
                     }
             }
     }
 
     private fun applyConversationSnapshot(conversation: Conversation) {
-        if (mutableUiState.value.peer?.id != conversation.peer.id) {
+        val activePeer = mutableUiState.value.peer
+        val matchesActivePeer =
+            activePeer != null &&
+                (activePeer.id == conversation.peer.id || activePeer.address == conversation.peer.address)
+        if (!matchesActivePeer) {
             return
         }
         val isTransitioning =
@@ -184,7 +237,10 @@ class ChatViewModel(
             cancelActiveSessionJobs()
         }
         mutableUiState.update { state ->
-            if (state.peer?.id != conversation.peer.id) {
+            val statePeer = state.peer
+            if (statePeer == null ||
+                (statePeer.id != conversation.peer.id && statePeer.address != conversation.peer.address)
+            ) {
                 state
             } else {
                 state.copy(
@@ -238,10 +294,17 @@ class ChatViewModel(
                         applyConversationSnapshot(conversation)
                     },
                     onFailure = { failure ->
-                        updateStateForPeer(peer.id) {
+                        updateStateForPeer(peer.id, peer.address) {
                             it.copy(
                                 isConnecting = false,
                                 error = failure.toPresentationError(),
+                            )
+                        }
+                        acceptIncomingSessionsUseCase?.ensureServerListening()?.onFailure { error ->
+                            logger.warn(
+                                tag = PresentationConstants.TAG_CHAT_VIEW_MODEL,
+                                message = "Failed to restart RFCOMM server listener after connect failure.",
+                                throwable = error,
                             )
                         }
                     },
@@ -291,18 +354,32 @@ class ChatViewModel(
             requirePeerScope().launch {
                 establishSecureSessionUseCase.disconnect(peer.id).fold(
                     onSuccess = {
-                        updateStateForPeer(peer.id) {
+                        updateStateForPeer(peer.id, peer.address) {
                             it.copy(
                                 sessionState = SessionState.DISCONNECTED,
                                 isConnecting = false,
                             )
                         }
+                        acceptIncomingSessionsUseCase?.ensureServerListening()?.onFailure { error ->
+                            logger.warn(
+                                tag = PresentationConstants.TAG_CHAT_VIEW_MODEL,
+                                message = "Failed to restart RFCOMM server listener after manual disconnect.",
+                                throwable = error,
+                            )
+                        }
                     },
                     onFailure = { failure ->
-                        updateStateForPeer(peer.id) {
+                        updateStateForPeer(peer.id, peer.address) {
                             it.copy(
                                 isConnecting = false,
                                 error = failure.toPresentationError(),
+                            )
+                        }
+                        acceptIncomingSessionsUseCase?.ensureServerListening()?.onFailure { error ->
+                            logger.warn(
+                                tag = PresentationConstants.TAG_CHAT_VIEW_MODEL,
+                                message = "Failed to restart RFCOMM server listener after connect failure.",
+                                throwable = error,
                             )
                         }
                     },
@@ -465,10 +542,15 @@ class ChatViewModel(
 
     private fun updateStateForPeer(
         peerId: PeerId,
+        peerAddress: BluetoothAddress? = null,
         transform: (ChatUiState) -> ChatUiState,
     ) {
         mutableUiState.update { current ->
-            if (current.peer?.id == peerId) transform(current) else current
+            val currentPeer = current.peer
+            val matches =
+                currentPeer != null &&
+                    (currentPeer.id == peerId || (peerAddress != null && currentPeer.address == peerAddress))
+            if (matches) transform(current) else current
         }
     }
 

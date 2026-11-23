@@ -42,10 +42,13 @@ fun BlueMessengerApp(
     var isCompactChatOpen by remember { mutableStateOf(false) }
 
     val onPeerSelected: (Peer) -> Unit = { peer ->
-        val existingConversation = discoveryState.conversations.firstOrNull { it.peer.id == peer.id }
+        val existingConversation =
+            discoveryState.conversations.firstOrNull {
+                it.peer.id == peer.id || it.peer.address == peer.address
+            }
         chatViewModel.onIntent(
             ChatIntent.OpenPeer(
-                peer = peer,
+                peer = existingConversation?.peer ?: peer,
                 conversationId = existingConversation?.id,
                 sessionState = existingConversation?.state ?: SessionState.DISCONNECTED,
             ),

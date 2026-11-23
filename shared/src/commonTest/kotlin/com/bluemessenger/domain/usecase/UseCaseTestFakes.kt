@@ -21,6 +21,7 @@ import com.bluemessenger.domain.ports.storage.MessageRepository
 import com.bluemessenger.domain.ports.storage.PeerRepository
 import com.bluemessenger.domain.ports.transport.BluetoothScanner
 import com.bluemessenger.domain.ports.transport.BluetoothTransport
+import com.bluemessenger.domain.ports.transport.model.IncomingPeerConnection
 import com.bluemessenger.domain.ports.transport.model.Packet
 import com.bluemessenger.domain.primitives.BluetoothAddress
 import com.bluemessenger.domain.primitives.ConversationId
@@ -41,6 +42,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -341,11 +343,14 @@ internal class FakeBluetoothTransport(
 ) : BluetoothTransport {
     private val _sessionState = MutableStateFlow(initialState)
     private val _incomingPackets = MutableSharedFlow<Packet>(extraBufferCapacity = 64)
+    private val _incomingConnections = MutableSharedFlow<IncomingPeerConnection>(extraBufferCapacity = 8)
 
     override val sessionState: StateFlow<SessionState> = _sessionState.asStateFlow()
     override val incomingPackets: Flow<Packet> = _incomingPackets.asSharedFlow()
+    override val incomingConnections: Flow<IncomingPeerConnection> = _incomingConnections.asSharedFlow()
 
     val sentPackets: MutableList<Packet> = mutableListOf()
+    var startServerCount: Int = 0
     var connectAttempts: Int = 0
     var disconnectCount: Int = 0
 
@@ -363,8 +368,17 @@ internal class FakeBluetoothTransport(
         _incomingPackets.emit(packet)
     }
 
+    suspend fun emitIncomingConnection(connection: IncomingPeerConnection) {
+        _incomingConnections.emit(connection)
+    }
+
+    suspend fun awaitIncomingPacketSubscriber() {
+        _incomingPackets.subscriptionCount.first { count -> count > 0 }
+    }
+
     override suspend fun startServer(): Result<Unit> {
-        _sessionState.value = SessionState.CONNECTING
+        startServerCount += 1
+        _sessionState.value = SessionState.ADVERTISING
         return Result.success(Unit)
     }
 

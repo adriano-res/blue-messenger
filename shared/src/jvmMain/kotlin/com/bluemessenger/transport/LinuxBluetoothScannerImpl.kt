@@ -15,7 +15,6 @@ import com.bluemessenger.transport.constants.BluezDbusConstants
 import com.bluemessenger.transport.constants.LinuxTransportConstants
 import com.bluemessenger.transport.dbus.BluezDbusClient
 import com.bluemessenger.transport.dbus.BluezDbusErrorMapper
-import com.bluemessenger.transport.dbus.BluezProfile1
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -23,8 +22,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.freedesktop.dbus.DBusPath
-import org.freedesktop.dbus.FileDescriptor
 import org.freedesktop.dbus.exceptions.DBusException
 import org.freedesktop.dbus.exceptions.DBusExecutionException
 import org.freedesktop.dbus.interfaces.ObjectManager
@@ -93,10 +90,11 @@ class LinuxBluetoothScannerImpl internal constructor(
 
     private val devicePropsByPath: MutableMap<String, MutableMap<String, Variant<*>>> = LinkedHashMap()
     private val discoveredByPath: MutableMap<String, Peer> = LinkedHashMap()
+    private val canonicalServicePaths: MutableSet<String> = LinkedHashSet()
     private val signalRegistrations: MutableList<AutoCloseable> = mutableListOf()
 
     private var activeDiscoveryAdapterPath: String? = null
-    private var isAdvertisingProfileExported: Boolean = false
+    private var activeAdvertisingAdapterPath: String? = null
 
     /**
      * Starts filtered BlueZ BR/EDR discovery for peers advertising
@@ -151,8 +149,8 @@ class LinuxBluetoothScannerImpl internal constructor(
         }
 
     /**
-     * Updates the adapter alias to [localNickname], enables discoverability, and registers the
-     * Blue Messenger SDP service record on BlueZ `ProfileManager1`.
+     * Updates the adapter alias to [localNickname] and enables discoverability so nearby peers can
+     * resolve and connect to the active Blue Messenger RFCOMM transport profile.
      */
     override suspend fun startAdvertising(localNickname: String): Result<Unit> {
         val normalizedNickname = localNickname.trim()
@@ -175,27 +173,26 @@ class LinuxBluetoothScannerImpl internal constructor(
     }
 
     /**
-     * Unregisters the Blue Messenger SDP service record and disables advertising state.
+     * Disables adapter discoverability and marks local advertising inactive.
      */
     override suspend fun stopAdvertising(): Result<Unit> =
         stateMutex.withLock {
             withContext(dispatchers.io) {
                 val wasAdvertising = _isAdvertising.value
-                val wasExported = isAdvertisingProfileExported
+                val adapterPath = activeAdvertisingAdapterPath
                 _isAdvertising.value = false
-                isAdvertisingProfileExported = false
+                activeAdvertisingAdapterPath = null
                 try {
-                    if (wasAdvertising) {
-                        bluezClient.profileManager().unregisterProfile(
-                            DBusPath(BluezDbusConstants.LOCAL_SCANNER_PROFILE_PATH),
+                    if (wasAdvertising && adapterPath != null) {
+                        bluezClient.adapterProperties(adapterPath).Set(
+                            BluezDbusConstants.ADAPTER1_INTERFACE,
+                            BluezDbusConstants.PROPERTY_DISCOVERABLE,
+                            false,
                         )
-                    }
-                    if (wasExported) {
-                        bluezClient.unexportObject(BluezDbusConstants.LOCAL_SCANNER_PROFILE_PATH)
                     }
                     logger.info(
                         tag = LinuxTransportConstants.TAG_SCANNER,
-                        message = "Stopped BlueZ SDP advertising.",
+                        message = "Stopped BlueZ Bluetooth discoverability advertising.",
                     )
                     Result.success(Unit)
                 } catch (cancellation: CancellationException) {
@@ -206,26 +203,19 @@ class LinuxBluetoothScannerImpl internal constructor(
                     failMapped("stopping BlueZ advertising", exception)
                 } catch (exception: IOException) {
                     failMapped("stopping BlueZ advertising", exception)
-                } finally {
-                    if (wasExported) {
-                        bluezClient.unexportObject(BluezDbusConstants.LOCAL_SCANNER_PROFILE_PATH)
-                    }
                 }
             }
         }
 
     /**
-     * Releases D-Bus signal listeners and unexports the local scanner profile object if active.
+     * Releases D-Bus signal listeners and resets scanner discovery/advertising state.
      */
     override fun close() {
         closeSignalRegistrations()
         _isScanning.value = false
         _isAdvertising.value = false
         activeDiscoveryAdapterPath = null
-        if (isAdvertisingProfileExported) {
-            isAdvertisingProfileExported = false
-            bluezClient.unexportObject(BluezDbusConstants.LOCAL_SCANNER_PROFILE_PATH)
-        }
+        activeAdvertisingAdapterPath = null
     }
 
     private fun startDiscoveryOnAdapter(adapterPath: String): Result<Unit> {
@@ -233,6 +223,7 @@ class LinuxBluetoothScannerImpl internal constructor(
             synchronized(peersLock) {
                 devicePropsByPath.clear()
                 discoveredByPath.clear()
+                canonicalServicePaths.clear()
                 _discoveredPeers.value = emptyList()
             }
             registerSignalHandlers()
@@ -241,11 +232,6 @@ class LinuxBluetoothScannerImpl internal constructor(
             val adapter = bluezClient.adapter(adapterPath)
             val filter =
                 mapOf(
-                    BluezDbusConstants.DISCOVERY_FILTER_UUIDS to
-                        Variant(
-                            listOf(TransportConstants.CANONICAL_SERVICE_UUID),
-                            BluezDbusConstants.DBUS_STRING_ARRAY_SIGNATURE,
-                        ),
                     BluezDbusConstants.DISCOVERY_FILTER_TRANSPORT to
                         Variant(BluezDbusConstants.DISCOVERY_TRANSPORT_BR_EDR),
                 )
@@ -294,11 +280,11 @@ class LinuxBluetoothScannerImpl internal constructor(
                 true,
             )
 
-            registerAdvertisingProfile(nickname)
+            activeAdvertisingAdapterPath = adapterPath
             _isAdvertising.value = true
             logger.info(
                 tag = LinuxTransportConstants.TAG_SCANNER,
-                message = "Started BlueZ SDP advertising.",
+                message = "Started BlueZ Bluetooth discoverability advertising.",
                 context = mapOf("adapterPath" to adapterPath),
             )
             Result.success(Unit)
@@ -319,39 +305,9 @@ class LinuxBluetoothScannerImpl internal constructor(
         }
     }
 
-    private fun registerAdvertisingProfile(nickname: String) {
-        if (_isAdvertising.value) {
-            bluezClient.profileManager().unregisterProfile(
-                DBusPath(BluezDbusConstants.LOCAL_SCANNER_PROFILE_PATH),
-            )
-            _isAdvertising.value = false
-        }
-        if (!isAdvertisingProfileExported) {
-            bluezClient.exportProfile(
-                BluezDbusConstants.LOCAL_SCANNER_PROFILE_PATH,
-                AdvertisingStubProfile(bluezClient, dispatchers, logger),
-            )
-            isAdvertisingProfileExported = true
-        }
-        val options =
-            mapOf(
-                BluezDbusConstants.PROFILE_OPTION_NAME to Variant(nickname),
-                BluezDbusConstants.PROFILE_OPTION_ROLE to Variant(BluezDbusConstants.PROFILE_ROLE_SERVER),
-                BluezDbusConstants.PROFILE_OPTION_SERVICE to Variant(TransportConstants.CANONICAL_SERVICE_UUID),
-            )
-        bluezClient.profileManager().registerProfile(
-            DBusPath(BluezDbusConstants.LOCAL_SCANNER_PROFILE_PATH),
-            TransportConstants.CANONICAL_SERVICE_UUID,
-            options,
-        )
-    }
-
     private fun cleanupFailedAdvertising() {
         _isAdvertising.value = false
-        if (isAdvertisingProfileExported) {
-            isAdvertisingProfileExported = false
-            bluezClient.unexportObject(BluezDbusConstants.LOCAL_SCANNER_PROFILE_PATH)
-        }
+        activeAdvertisingAdapterPath = null
     }
 
     private fun registerSignalHandlers() {
@@ -382,17 +338,20 @@ class LinuxBluetoothScannerImpl internal constructor(
     }
 
     private fun handleInterfacesAdded(signal: ObjectManager.InterfacesAdded) {
+        val devicePath = signal.signalSource?.path ?: return
         val deviceProps = signal.interfaces[BluezDbusConstants.DEVICE1_INTERFACE] ?: return
-        upsertDeviceFromProperties(signal.objectPath, deviceProps)
+        upsertDeviceFromProperties(devicePath, deviceProps)
     }
 
     private fun handleInterfacesRemoved(signal: ObjectManager.InterfacesRemoved) {
         if (BluezDbusConstants.DEVICE1_INTERFACE !in signal.interfaces) {
             return
         }
+        val devicePath = signal.signalSource?.path ?: return
         synchronized(peersLock) {
-            devicePropsByPath.remove(signal.objectPath)
-            if (discoveredByPath.remove(signal.objectPath) != null) {
+            devicePropsByPath.remove(devicePath)
+            canonicalServicePaths.remove(devicePath)
+            if (discoveredByPath.remove(devicePath) != null) {
                 publishPeersSnapshotLocked()
             }
         }
@@ -413,48 +372,86 @@ class LinuxBluetoothScannerImpl internal constructor(
         synchronized(peersLock) {
             val mergedProps = devicePropsByPath.getOrPut(objectPath) { LinkedHashMap() }
             mergedProps.putAll(incomingProps)
-            val peer = buildMatchingPeerOrNull(mergedProps)
-            if (peer != null) {
-                discoveredByPath[objectPath] = peer
+            val candidate = buildCandidatePeerOrNull(mergedProps)
+            if (candidate != null) {
+                discoveredByPath[objectPath] = candidate.peer
+                if (candidate.hasCanonicalServiceUuid) {
+                    canonicalServicePaths.add(objectPath)
+                } else {
+                    canonicalServicePaths.remove(objectPath)
+                }
                 publishPeersSnapshotLocked()
-            } else if (discoveredByPath.remove(objectPath) != null) {
-                publishPeersSnapshotLocked()
+            } else {
+                canonicalServicePaths.remove(objectPath)
+                if (discoveredByPath.remove(objectPath) != null) {
+                    publishPeersSnapshotLocked()
+                }
             }
         }
     }
 
-    private fun buildMatchingPeerOrNull(props: Map<String, Variant<*>>): Peer? {
+    private fun buildCandidatePeerOrNull(props: Map<String, Variant<*>>): DiscoveredCandidate? {
         val uuids = extractStringList(props[BluezDbusConstants.PROPERTY_UUIDS])
-        val advertisesCanonicalService =
+        val hasCanonicalServiceUuid =
             uuids.any { uuid -> uuid.equals(TransportConstants.CANONICAL_SERVICE_UUID, ignoreCase = true) }
+        val displayName = extractHumanReadableName(props)
+        val isDiscoverableOrPaired =
+            props.containsKey(BluezDbusConstants.PROPERTY_RSSI) ||
+                extractBoolean(props[BluezDbusConstants.PROPERTY_PAIRED]) ||
+                extractBoolean(props[BluezDbusConstants.PROPERTY_CONNECTED])
+        val shouldInclude = hasCanonicalServiceUuid || (isDiscoverableOrPaired && displayName != null)
         val address =
-            if (advertisesCanonicalService) {
+            if (shouldInclude) {
                 extractString(props[BluezDbusConstants.PROPERTY_ADDRESS])
                     ?.let { raw -> BluetoothAddress.parse(raw).getOrNull() }
             } else {
                 null
             }
         return address?.let { resolvedAddress ->
-            val nickname =
-                extractString(props[BluezDbusConstants.PROPERTY_ALIAS])?.takeIf { it.isNotBlank() }
-                    ?: extractString(props[BluezDbusConstants.PROPERTY_NAME])?.takeIf { it.isNotBlank() }
-                    ?: resolvedAddress.value
+            val nickname = displayName ?: resolvedAddress.value
             val existingId = discoveredByPath.values.firstOrNull { it.address == resolvedAddress }?.id
-            Peer(
-                id = existingId ?: deterministicPeerId(resolvedAddress),
-                nickname = nickname,
-                address = resolvedAddress,
-                identityKey = null,
-                isVerified = false,
-                lastSeenAt = clock(),
-            )
+            val peer =
+                Peer(
+                    id = existingId ?: deterministicPeerId(resolvedAddress),
+                    nickname = nickname,
+                    address = resolvedAddress,
+                    identityKey = null,
+                    isVerified = false,
+                    lastSeenAt = clock(),
+                )
+            DiscoveredCandidate(peer = peer, hasCanonicalServiceUuid = hasCanonicalServiceUuid)
         }
+    }
+
+    private fun extractHumanReadableName(props: Map<String, Variant<*>>): String? {
+        val name =
+            extractString(props[BluezDbusConstants.PROPERTY_NAME])
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() && !isMacLikeName(it) }
+        val alias =
+            extractString(props[BluezDbusConstants.PROPERTY_ALIAS])
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() && !isMacLikeName(it) }
+        return name ?: alias
+    }
+
+    private fun isMacLikeName(candidate: String): Boolean {
+        val normalized =
+            candidate.trim().replace(
+                LinuxTransportConstants.MAC_HYPHEN_CHAR,
+                LinuxTransportConstants.MAC_COLON_CHAR,
+            )
+        return BluetoothAddress.parse(normalized).isSuccess
     }
 
     private fun publishPeersSnapshotLocked() {
         _discoveredPeers.value =
-            discoveredByPath.values
-                .sortedWith(compareBy<Peer> { it.nickname }.thenBy { it.address.value })
+            discoveredByPath.entries
+                .sortedWith(
+                    compareBy<Map.Entry<String, Peer>> { it.key !in canonicalServicePaths }
+                        .thenBy { it.value.nickname }
+                        .thenBy { it.value.address.value },
+                ).map { entry -> entry.value }
     }
 
     private fun closeSignalRegistrations() {
@@ -479,6 +476,8 @@ class LinuxBluetoothScannerImpl internal constructor(
     }
 
     private fun extractString(variant: Variant<*>?): String? = variant?.value as? String
+
+    private fun extractBoolean(variant: Variant<*>?): Boolean = variant?.value as? Boolean ?: false
 
     private fun extractStringList(variant: Variant<*>?): List<String> =
         when (val value = variant?.value) {
@@ -521,64 +520,8 @@ class LinuxBluetoothScannerImpl internal constructor(
         return domainError.asFailure(throwable)
     }
 
-    private class AdvertisingStubProfile(
-        private val bluezClient: BluezDbusClient,
-        private val dispatchers: CoroutineDispatchers,
-        private val logger: AppLogger,
-    ) : BluezProfile1 {
-        override fun isRemote(): Boolean = false
-
-        override fun getObjectPath(): String = BluezDbusConstants.LOCAL_SCANNER_PROFILE_PATH
-
-        override fun release() {
-            logger.debug(
-                tag = LinuxTransportConstants.TAG_SCANNER,
-                message = "BlueZ advertising profile released.",
-            )
-        }
-
-        override fun newConnection(
-            device: DBusPath,
-            fd: FileDescriptor,
-            fdProperties: Map<String, Variant<*>>,
-        ) {
-            logger.warn(
-                tag = LinuxTransportConstants.TAG_SCANNER,
-                message = "Received unexpected connection on advertising-only BlueZ profile; closing FD.",
-                context = mapOf("devicePath" to device.path),
-            )
-            try {
-                bluezClient.openRfcommChannel(fd, dispatchers, logger).close()
-            } catch (exception: DBusException) {
-                logger.warn(
-                    tag = LinuxTransportConstants.TAG_SCANNER,
-                    message = "Failed to close unexpected FD on advertising profile.",
-                    throwable = exception,
-                    context = mapOf("devicePath" to device.path),
-                )
-            } catch (exception: IOException) {
-                logger.warn(
-                    tag = LinuxTransportConstants.TAG_SCANNER,
-                    message = "Failed to close unexpected FD on advertising profile.",
-                    throwable = exception,
-                    context = mapOf("devicePath" to device.path),
-                )
-            } catch (exception: IllegalStateException) {
-                logger.warn(
-                    tag = LinuxTransportConstants.TAG_SCANNER,
-                    message = "Failed to close unexpected FD on advertising profile.",
-                    throwable = exception,
-                    context = mapOf("devicePath" to device.path),
-                )
-            }
-        }
-
-        override fun requestDisconnection(device: DBusPath) {
-            logger.debug(
-                tag = LinuxTransportConstants.TAG_SCANNER,
-                message = "BlueZ advertising profile received RequestDisconnection.",
-                context = mapOf("devicePath" to device.path),
-            )
-        }
-    }
+    private data class DiscoveredCandidate(
+        val peer: Peer,
+        val hasCanonicalServiceUuid: Boolean,
+    )
 }

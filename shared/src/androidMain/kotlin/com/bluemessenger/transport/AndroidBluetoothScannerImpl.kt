@@ -17,9 +17,15 @@ import com.bluemessenger.domain.primitives.Instant
 import com.bluemessenger.domain.primitives.PeerId
 import com.bluemessenger.transport.constants.AndroidTransportConstants
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -48,6 +54,7 @@ class AndroidBluetoothScannerImpl internal constructor(
     private val dispatchers: CoroutineDispatchers,
     private val logger: AppLogger,
     private val clock: () -> Instant,
+    private val postDiscoverySdpTimeoutMs: Long = AndroidTransportConstants.POST_DISCOVERY_SDP_WINDOW_MS,
 ) : BluetoothScanner, Closeable {
     constructor(
         context: Context,
@@ -77,6 +84,7 @@ class AndroidBluetoothScannerImpl internal constructor(
     private val stateMutex: Mutex = Mutex()
     private val peersLock: Any = Any()
     private val resourceLock: Any = Any()
+    private val scannerScope: CoroutineScope = CoroutineScope(SupervisorJob() + dispatchers.io)
 
     private val _discoveredPeers: MutableStateFlow<List<Peer>> = MutableStateFlow(emptyList())
     override val discoveredPeers: StateFlow<List<Peer>> = _discoveredPeers.asStateFlow()
@@ -89,9 +97,12 @@ class AndroidBluetoothScannerImpl internal constructor(
 
     private val devicesByAddress: MutableMap<String, AndroidDiscoveredDevice> = LinkedHashMap()
     private val discoveredByAddress: MutableMap<String, Peer> = LinkedHashMap()
+    private val canonicalServiceAddresses: MutableSet<String> = LinkedHashSet()
+    private val pendingSdpAddresses: MutableSet<String> = LinkedHashSet()
 
+    private var discoveryInquiryFinished: Boolean = false
     private var receiverRegistration: AutoCloseable? = null
-    private var advertisingServerSocket: AndroidServerSocketHandle? = null
+    private var postDiscoveryCleanupJob: Job? = null
 
     /**
      * Starts classic Bluetooth discovery, registers `ACTION_FOUND`/`ACTION_UUID`/
@@ -118,7 +129,12 @@ class AndroidBluetoothScannerImpl internal constructor(
     override suspend fun stopDiscovery(): Result<Unit> =
         stateMutex.withLock {
             withContext(dispatchers.io) {
+                cancelPostDiscoveryCleanup()
                 closeReceiverRegistration()
+                synchronized(peersLock) {
+                    pendingSdpAddresses.clear()
+                    discoveryInquiryFinished = false
+                }
                 val wasScanning = _isScanning.value
                 _isScanning.value = false
                 if (!wasScanning) {
@@ -129,8 +145,8 @@ class AndroidBluetoothScannerImpl internal constructor(
         }
 
     /**
-     * Registers an insecure RFCOMM SDP service record with [TransportConstants.CANONICAL_SERVICE_UUID]
-     * using [localNickname].
+     * Triggers system Bluetooth discoverability advertising so nearby scanners can discover this
+     * device while [AndroidBluetoothTransportImpl] accepts incoming RFCOMM connections.
      */
     override suspend fun startAdvertising(localNickname: String): Result<Unit> {
         val normalizedNickname = localNickname.trim()
@@ -146,40 +162,45 @@ class AndroidBluetoothScannerImpl internal constructor(
                 permissionChecker.ensureAdvertiseReady().getOrElse { error ->
                     return@withContext Result.failure(error)
                 }
-                startAdvertisingInternal(normalizedNickname)
+                startAdvertisingInternal()
             }
         }
     }
 
     /**
-     * Closes the advertising SDP server socket and sets [isAdvertising] to `false`.
+     * Marks Android discoverability advertising inactive.
      */
     override suspend fun stopAdvertising(): Result<Unit> =
         stateMutex.withLock {
             withContext(dispatchers.io) {
                 _isAdvertising.value = false
-                closeAdvertisingSocket()
                 logger.info(
                     tag = AndroidTransportConstants.TAG_SCANNER,
-                    message = "Stopped Android Bluetooth SDP advertising.",
+                    message = "Stopped Android Bluetooth discoverability advertising.",
                 )
                 Result.success(Unit)
             }
         }
 
     /**
-     * Deterministically releases registered broadcast receivers and any active advertising
-     * [AndroidServerSocketHandle].
+     * Deterministically releases registered broadcast receivers and cancels background SDP cleanup.
      */
     override fun close() {
+        cancelPostDiscoveryCleanup()
         closeReceiverRegistration()
-        closeAdvertisingSocket()
+        synchronized(peersLock) {
+            pendingSdpAddresses.clear()
+            discoveryInquiryFinished = false
+        }
         _isScanning.value = false
         _isAdvertising.value = false
+        scannerScope.cancel()
     }
 
     private fun startDiscoveryInternal(): Result<Unit> {
         return try {
+            cancelPostDiscoveryCleanup()
+            closeReceiverRegistration()
             resetDiscoveryState()
             val registration =
                 gateway.registerDiscoveryReceivers(
@@ -244,69 +265,70 @@ class AndroidBluetoothScannerImpl internal constructor(
             failAdapterException("stopping Android Bluetooth discovery", exception)
         }
 
-    private fun startAdvertisingInternal(nickname: String): Result<Unit> {
-        closeAdvertisingSocket()
-        _isAdvertising.value = false
-        return try {
-            val handle =
-                gateway.openInsecureServerSocket(
-                    serviceName = nickname,
-                    serviceUuid = TransportConstants.CANONICAL_SERVICE_UUID,
-                )
-            synchronized(resourceLock) {
-                advertisingServerSocket = handle
-            }
+    private fun startAdvertisingInternal(): Result<Unit> =
+        try {
+            gateway.requestDiscoverable()
             _isAdvertising.value = true
             logger.info(
                 tag = AndroidTransportConstants.TAG_SCANNER,
-                message = "Started Android Bluetooth SDP advertising.",
+                message = "Started Android Bluetooth discoverability advertising.",
             )
             Result.success(Unit)
         } catch (cancellation: CancellationException) {
-            closeAdvertisingSocket()
             throw cancellation
         } catch (exception: SecurityException) {
-            closeAdvertisingSocket()
+            _isAdvertising.value = false
             failMissingPermission(
                 action = "starting Android Bluetooth advertising",
                 defaultPermission = Manifest.permission.BLUETOOTH_ADVERTISE,
                 exception = exception,
             )
-        } catch (exception: IOException) {
-            closeAdvertisingSocket()
-            failAdapterException("starting Android Bluetooth advertising", exception)
         } catch (exception: IllegalStateException) {
-            closeAdvertisingSocket()
+            _isAdvertising.value = false
             failAdapterException("starting Android Bluetooth advertising", exception)
         }
-    }
 
     private fun resetDiscoveryState() {
         synchronized(peersLock) {
             devicesByAddress.clear()
             discoveredByAddress.clear()
+            canonicalServiceAddresses.clear()
+            pendingSdpAddresses.clear()
+            discoveryInquiryFinished = false
             _discoveredPeers.value = emptyList()
         }
     }
 
     private fun syncBondedDevices() {
         val bondedDevices = gateway.getBondedDevices()
-        val addressesMissingUuids = mutableListOf<String>()
+        val addressesToFetch = mutableListOf<String>()
         for (device in bondedDevices) {
-            val merged = mergeAndPublishDevice(device)
-            if (merged.uuids.isEmpty()) {
-                addressesMissingUuids.add(merged.address)
+            val merged = mergeAndPublishDevice(device, replaceUuids = false)
+            if (!merged.hasCanonicalServiceUuid()) {
+                synchronized(peersLock) {
+                    if (pendingSdpAddresses.add(merged.address)) {
+                        addressesToFetch.add(merged.address)
+                    }
+                }
             }
         }
-        for (address in addressesMissingUuids) {
-            triggerSdpUuidFetch(address)
-        }
+        fetchPendingSdpAddresses(addressesToFetch)
     }
 
     private fun handleDeviceFound(device: AndroidDiscoveredDevice) {
-        val merged = mergeAndPublishDevice(device)
-        if (merged.uuids.isEmpty()) {
-            triggerSdpUuidFetch(merged.address)
+        val merged = mergeAndPublishDevice(device, replaceUuids = false)
+        if (!merged.hasCanonicalServiceUuid()) {
+            val shouldFetch =
+                synchronized(peersLock) {
+                    pendingSdpAddresses.add(merged.address)
+                }
+            if (shouldFetch) {
+                fetchPendingSdpAddresses(listOf(merged.address))
+            }
+        } else {
+            synchronized(peersLock) {
+                pendingSdpAddresses.remove(merged.address)
+            }
         }
     }
 
@@ -314,17 +336,78 @@ class AndroidBluetoothScannerImpl internal constructor(
         address: String,
         uuids: List<String>,
     ) {
+        val normalizedAddress = address.trim().uppercase()
         mergeAndPublishDevice(
-            AndroidDiscoveredDevice(
-                address = address,
-                name = null,
-                uuids = uuids,
-            ),
+            incoming =
+                AndroidDiscoveredDevice(
+                    address = normalizedAddress,
+                    name = null,
+                    uuids = uuids,
+                ),
+            replaceUuids = true,
         )
+        val shouldComplete =
+            synchronized(peersLock) {
+                pendingSdpAddresses.remove(normalizedAddress)
+                discoveryInquiryFinished && pendingSdpAddresses.isEmpty()
+            }
+        if (shouldComplete) {
+            completeDiscoveryScan()
+        }
     }
 
     private fun handleDiscoveryFinished() {
+        cancelPostDiscoveryCleanup()
+        val remaining =
+            synchronized(peersLock) {
+                discoveryInquiryFinished = true
+                pendingSdpAddresses.toList()
+            }
+        if (remaining.isEmpty()) {
+            completeDiscoveryScan()
+            return
+        }
+        fetchPendingSdpAddresses(remaining)
+        val stillPending =
+            synchronized(peersLock) {
+                pendingSdpAddresses.isNotEmpty()
+            }
+        if (!stillPending) {
+            completeDiscoveryScan()
+        } else {
+            schedulePostDiscoveryCleanup()
+        }
+    }
+
+    private fun fetchPendingSdpAddresses(addresses: List<String>) {
+        for (address in addresses) {
+            val initiated = triggerSdpUuidFetch(address)
+            if (!initiated) {
+                synchronized(peersLock) {
+                    pendingSdpAddresses.remove(address)
+                }
+            }
+        }
+    }
+
+    private fun schedulePostDiscoveryCleanup() {
+        synchronized(resourceLock) {
+            postDiscoveryCleanupJob?.cancel()
+            postDiscoveryCleanupJob =
+                scannerScope.launch {
+                    delay(postDiscoverySdpTimeoutMs)
+                    completeDiscoveryScan()
+                }
+        }
+    }
+
+    private fun completeDiscoveryScan() {
+        cancelPostDiscoveryCleanup()
         closeReceiverRegistration()
+        synchronized(peersLock) {
+            pendingSdpAddresses.clear()
+            discoveryInquiryFinished = false
+        }
         _isScanning.value = false
         logger.debug(
             tag = AndroidTransportConstants.TAG_SCANNER,
@@ -338,11 +421,10 @@ class AndroidBluetoothScannerImpl internal constructor(
             message = "Discovery broadcast receiver encountered SecurityException; stopping discovery.",
             throwable = exception,
         )
-        closeReceiverRegistration()
-        _isScanning.value = false
+        completeDiscoveryScan()
     }
 
-    private fun triggerSdpUuidFetch(address: String) {
+    private fun triggerSdpUuidFetch(address: String): Boolean =
         try {
             gateway.fetchUuidsWithSdp(address)
         } catch (exception: SecurityException) {
@@ -352,6 +434,7 @@ class AndroidBluetoothScannerImpl internal constructor(
                 throwable = exception,
                 context = mapOf("address" to address),
             )
+            false
         } catch (exception: IllegalStateException) {
             logger.warn(
                 tag = AndroidTransportConstants.TAG_SCANNER,
@@ -359,10 +442,13 @@ class AndroidBluetoothScannerImpl internal constructor(
                 throwable = exception,
                 context = mapOf("address" to address),
             )
+            false
         }
-    }
 
-    private fun mergeAndPublishDevice(incoming: AndroidDiscoveredDevice): AndroidDiscoveredDevice {
+    private fun mergeAndPublishDevice(
+        incoming: AndroidDiscoveredDevice,
+        replaceUuids: Boolean,
+    ): AndroidDiscoveredDevice {
         val key = incoming.address.trim().uppercase()
         synchronized(peersLock) {
             val previous = devicesByAddress[key]
@@ -370,10 +456,10 @@ class AndroidBluetoothScannerImpl internal constructor(
                 incoming.name?.takeIf { it.isNotBlank() }
                     ?: previous?.name?.takeIf { it.isNotBlank() }
             val mergedUuids =
-                if (incoming.uuids.isNotEmpty()) {
-                    incoming.uuids
-                } else {
-                    previous?.uuids.orEmpty()
+                when {
+                    replaceUuids -> incoming.uuids
+                    incoming.uuids.isNotEmpty() -> incoming.uuids
+                    else -> previous?.uuids.orEmpty()
                 }
             val merged =
                 AndroidDiscoveredDevice(
@@ -382,44 +468,76 @@ class AndroidBluetoothScannerImpl internal constructor(
                     uuids = mergedUuids,
                 )
             devicesByAddress[key] = merged
-            val peer = buildMatchingPeerOrNull(merged)
-            if (peer != null) {
-                discoveredByAddress[key] = peer
+            val candidate = buildMatchingPeerOrNull(merged)
+            if (candidate != null) {
+                discoveredByAddress[key] = candidate.peer
+                if (candidate.hasCanonicalServiceUuid) {
+                    canonicalServiceAddresses.add(key)
+                } else {
+                    canonicalServiceAddresses.remove(key)
+                }
                 publishPeersSnapshotLocked()
-            } else if (discoveredByAddress.remove(key) != null) {
-                publishPeersSnapshotLocked()
+            } else {
+                canonicalServiceAddresses.remove(key)
+                if (discoveredByAddress.remove(key) != null) {
+                    publishPeersSnapshotLocked()
+                }
             }
             return merged
         }
     }
 
-    private fun buildMatchingPeerOrNull(device: AndroidDiscoveredDevice): Peer? {
-        val hasCanonicalUuid =
-            device.uuids.any { uuid -> uuid.equals(TransportConstants.CANONICAL_SERVICE_UUID, ignoreCase = true) }
+    private fun AndroidDiscoveredDevice.hasCanonicalServiceUuid(): Boolean =
+        uuids.any { uuid -> uuid.equals(TransportConstants.CANONICAL_SERVICE_UUID, ignoreCase = true) }
+
+    private fun buildMatchingPeerOrNull(device: AndroidDiscoveredDevice): DiscoveredAndroidCandidate? {
+        val hasCanonicalUuid = device.hasCanonicalServiceUuid()
+        val displayName = extractHumanReadableName(device.name)
+        val shouldInclude = hasCanonicalUuid || displayName != null
         val resolvedAddress =
-            if (hasCanonicalUuid) {
+            if (shouldInclude) {
                 BluetoothAddress.parse(device.address).getOrNull()
             } else {
                 null
             }
         return resolvedAddress?.let { address ->
-            val nickname = device.name?.takeIf { it.isNotBlank() } ?: address.value
+            val nickname = displayName ?: address.value
             val existingId = discoveredByAddress[address.value]?.id
-            Peer(
-                id = existingId ?: deterministicPeerId(address),
-                nickname = nickname,
-                address = address,
-                identityKey = null,
-                isVerified = false,
-                lastSeenAt = clock(),
-            )
+            val peer =
+                Peer(
+                    id = existingId ?: deterministicPeerId(address),
+                    nickname = nickname,
+                    address = address,
+                    identityKey = null,
+                    isVerified = false,
+                    lastSeenAt = clock(),
+                )
+            DiscoveredAndroidCandidate(peer = peer, hasCanonicalServiceUuid = hasCanonicalUuid)
         }
+    }
+
+    private fun extractHumanReadableName(rawName: String?): String? {
+        val trimmed = rawName?.trim() ?: return null
+        return trimmed.takeIf { it.isNotEmpty() && !isMacLikeName(it) }
+    }
+
+    private fun isMacLikeName(candidate: String): Boolean {
+        val normalized =
+            candidate.trim().replace(
+                AndroidTransportConstants.MAC_HYPHEN_CHAR,
+                AndroidTransportConstants.MAC_COLON_CHAR,
+            )
+        return BluetoothAddress.parse(normalized).isSuccess
     }
 
     private fun publishPeersSnapshotLocked() {
         _discoveredPeers.value =
-            discoveredByAddress.values
-                .sortedWith(compareBy<Peer> { it.nickname }.thenBy { it.address.value })
+            discoveredByAddress.entries
+                .sortedWith(
+                    compareBy<Map.Entry<String, Peer>> { it.key !in canonicalServiceAddresses }
+                        .thenBy { it.value.nickname }
+                        .thenBy { it.value.address.value },
+                ).map { entry -> entry.value }
     }
 
     private fun deterministicPeerId(address: BluetoothAddress): PeerId {
@@ -465,20 +583,12 @@ class AndroidBluetoothScannerImpl internal constructor(
         }
     }
 
-    private fun closeAdvertisingSocket() {
-        val handle =
+    private fun cancelPostDiscoveryCleanup() {
+        val job =
             synchronized(resourceLock) {
-                advertisingServerSocket.also { advertisingServerSocket = null }
-            } ?: return
-        try {
-            handle.close()
-        } catch (exception: IOException) {
-            logger.debug(
-                tag = AndroidTransportConstants.TAG_SCANNER,
-                message = "Ignored IOException while closing advertising server socket.",
-                context = mapOf("reason" to (exception.message ?: "unknown")),
-            )
-        }
+                postDiscoveryCleanupJob.also { postDiscoveryCleanupJob = null }
+            }
+        job?.cancel()
     }
 
     private fun failMissingPermission(
@@ -538,4 +648,9 @@ class AndroidBluetoothScannerImpl internal constructor(
             else -> defaultPermission
         }
     }
+
+    private data class DiscoveredAndroidCandidate(
+        val peer: Peer,
+        val hasCanonicalServiceUuid: Boolean,
+    )
 }

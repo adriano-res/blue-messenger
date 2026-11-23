@@ -24,6 +24,7 @@ import com.bluemessenger.domain.usecase.peer.DiscoverPeersUseCase
 import com.bluemessenger.domain.usecase.peer.InitializeIdentityUseCase
 import com.bluemessenger.domain.usecase.peer.ObserveConversationsUseCase
 import com.bluemessenger.domain.usecase.peer.VerifyPeerSafetyNumberUseCase
+import com.bluemessenger.domain.usecase.session.AcceptIncomingSessionsUseCase
 import com.bluemessenger.domain.usecase.session.EstablishSecureSessionUseCase
 import com.bluemessenger.domain.usecase.session.ManageKeepAliveAndReconnectUseCase
 import com.bluemessenger.logging.AndroidAppLoggerImpl
@@ -64,12 +65,13 @@ class AndroidAppModule internal constructor(
         context: Context,
         dispatchers: CoroutineDispatchers,
         clock: () -> Instant = { Instant(System.currentTimeMillis()) },
+        onDiscoverableRequested: () -> Unit = {},
     ) : this(
         dispatchers = dispatchers,
         clock = clock,
         logger = AndroidAppLoggerImpl(),
         sqlDriver = AndroidDatabaseDriverFactory(context.applicationContext).createDriver(),
-        bluetoothGateway = AndroidBluetoothGateway(context.applicationContext),
+        bluetoothGateway = AndroidBluetoothGateway(context.applicationContext, onDiscoverableRequested),
         keyStoreVault = AndroidKeyStoreVault(context.applicationContext),
     )
 
@@ -153,6 +155,16 @@ class AndroidAppModule internal constructor(
             bluetoothTransport = bluetoothTransport,
             cryptoService = cryptoService,
             peerRepository = peerRepository,
+            dispatchers = dispatchers,
+            logger = logger,
+            clock = clock,
+        )
+
+    val acceptIncomingSessionsUseCase: AcceptIncomingSessionsUseCase =
+        AcceptIncomingSessionsUseCase(
+            bluetoothTransport = bluetoothTransport,
+            peerRepository = peerRepository,
+            establishSecureSessionUseCase = establishSecureSessionUseCase,
             dispatchers = dispatchers,
             logger = logger,
             clock = clock,

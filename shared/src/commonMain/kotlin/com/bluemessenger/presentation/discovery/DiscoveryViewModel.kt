@@ -5,6 +5,7 @@ import com.bluemessenger.domain.ports.logging.AppLogger
 import com.bluemessenger.domain.usecase.peer.DiscoverPeersUseCase
 import com.bluemessenger.domain.usecase.peer.InitializeIdentityUseCase
 import com.bluemessenger.domain.usecase.peer.ObserveConversationsUseCase
+import com.bluemessenger.domain.usecase.session.AcceptIncomingSessionsUseCase
 import com.bluemessenger.presentation.PresentationError
 import com.bluemessenger.presentation.constants.PresentationConstants
 import com.bluemessenger.presentation.toPresentationError
@@ -38,6 +39,7 @@ fun createPresentationScope(dispatchers: CoroutineDispatchers): CoroutineScope {
  * Failure behavior: Maps domain failures into [PresentationError] on [uiState], preserves
  * [CancellationException], and logs unexpected stream errors via [AppLogger].
  */
+@Suppress("LongParameterList")
 class DiscoveryViewModel(
     private val initializeIdentityUseCase: InitializeIdentityUseCase,
     private val discoverPeersUseCase: DiscoverPeersUseCase,
@@ -45,6 +47,7 @@ class DiscoveryViewModel(
     private val dispatchers: CoroutineDispatchers,
     private val logger: AppLogger,
     private val scope: CoroutineScope = createPresentationScope(dispatchers),
+    private val acceptIncomingSessionsUseCase: AcceptIncomingSessionsUseCase? = null,
 ) {
     private val mutableUiState: MutableStateFlow<DiscoveryUiState> = MutableStateFlow(DiscoveryUiState())
 
@@ -60,6 +63,16 @@ class DiscoveryViewModel(
         observeScannerState()
         observeConversations()
         loadInitialState()
+    }
+
+    /**
+     * Re-attempts starting the incoming RFCOMM listener after Bluetooth permissions are updated,
+     * provided the local identity has already been initialized.
+     */
+    fun onBluetoothPermissionsUpdated() {
+        if (mutableUiState.value.localIdentity != null) {
+            ensureServerListeningSilently()
+        }
     }
 
     /**
@@ -139,16 +152,21 @@ class DiscoveryViewModel(
             scope.launch(dispatchers.main) {
                 initializeIdentityUseCase.loadExisting().fold(
                     onSuccess = { identity ->
+                        var identityActive = false
                         mutableUiState.update { state ->
                             if (state.isInitializingIdentity) {
                                 state.copy(isLoadingIdentity = false)
                             } else {
+                                identityActive = (identity ?: state.localIdentity) != null
                                 state.copy(
                                     localIdentity = identity ?: state.localIdentity,
                                     nicknameInput = identity?.nickname ?: state.nicknameInput,
                                     isLoadingIdentity = false,
                                 )
                             }
+                        }
+                        if (identityActive) {
+                            ensureServerListeningSilently()
                         }
                     },
                     onFailure = { failure ->
@@ -198,6 +216,7 @@ class DiscoveryViewModel(
                                 error = null,
                             )
                         }
+                        ensureServerListeningSilently()
                     },
                     onFailure = { failure ->
                         mutableUiState.update { state ->
@@ -214,7 +233,27 @@ class DiscoveryViewModel(
     private fun startAdvertising() {
         val currentState = mutableUiState.value
         val nickname = currentState.localIdentity?.nickname ?: currentState.nicknameInput
-        runScannerAction { discoverPeersUseCase.startAdvertising(nickname) }
+        runScannerAction {
+            val serverOutcome = acceptIncomingSessionsUseCase?.ensureServerListening()
+            if (serverOutcome != null && serverOutcome.isFailure) {
+                serverOutcome
+            } else {
+                discoverPeersUseCase.startAdvertising(nickname)
+            }
+        }
+    }
+
+    private fun ensureServerListeningSilently() {
+        val acceptor = acceptIncomingSessionsUseCase ?: return
+        scope.launch(dispatchers.main) {
+            acceptor.ensureServerListening().onFailure { error ->
+                logger.warn(
+                    tag = PresentationConstants.TAG_DISCOVERY_VIEW_MODEL,
+                    message = "Deferred RFCOMM server listener startup until Bluetooth is ready.",
+                    throwable = error,
+                )
+            }
+        }
     }
 
     private fun runScannerAction(action: suspend () -> Result<Unit>) {

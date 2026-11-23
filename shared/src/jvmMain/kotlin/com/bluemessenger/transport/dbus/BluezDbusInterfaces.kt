@@ -28,6 +28,12 @@ internal interface BluezAdapter1 : DBusInterface {
  */
 @DBusInterfaceName(BluezDbusConstants.DEVICE1_INTERFACE)
 internal interface BluezDevice1 : DBusInterface {
+    @DBusMemberName("Connect")
+    fun connect()
+
+    @DBusMemberName("Disconnect")
+    fun disconnect() = Unit
+
     @DBusMemberName("ConnectProfile")
     fun connectProfile(uuid: String)
 

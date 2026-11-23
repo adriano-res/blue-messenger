@@ -16,6 +16,7 @@ import com.bluemessenger.domain.ports.transport.constants.TransportConstants
 import com.bluemessenger.domain.ports.transport.model.AckPacket
 import com.bluemessenger.domain.ports.transport.model.EncryptedPayloadPacket
 import com.bluemessenger.domain.ports.transport.model.HandshakePacket
+import com.bluemessenger.domain.ports.transport.model.IncomingPeerConnection
 import com.bluemessenger.domain.ports.transport.model.KeepAlivePacket
 import com.bluemessenger.domain.ports.transport.model.Packet
 import com.bluemessenger.domain.primitives.BluetoothAddress
@@ -116,16 +117,8 @@ class AndroidBluetoothTransportTest {
     fun scannerFiltersByCanonicalUuidHandlesBondedAndDiscoveryFinishedAndCleansUpDeterministically() {
         runBlocking {
             val logger = RecordingAppLogger()
-            val bondedNoUuid =
-                AndroidDiscoveredDevice(
-                    address = "AA:BB:CC:DD:EE:01",
-                    name = "BondedPeer",
-                    uuids = emptyList(),
-                )
-            val gateway =
-                FakeAndroidBluetoothGateway(
-                    bondedDevices = listOf(bondedNoUuid),
-                )
+            val bondedNoUuid = AndroidDiscoveredDevice("AA:BB:CC:DD:EE:01", "BondedPeer", emptyList())
+            val gateway = FakeAndroidBluetoothGateway(bondedDevices = listOf(bondedNoUuid))
             val scanner = createScanner(gateway, logger)
 
             assertTrue(scanner.startDiscovery().isSuccess)
@@ -133,16 +126,20 @@ class AndroidBluetoothTransportTest {
             assertTrue(gateway.discoveryStarted)
             assertEquals(1, gateway.activeReceiverCount)
             assertEquals(listOf("AA:BB:CC:DD:EE:01"), gateway.sdpFetchRequests.toList())
-            assertTrue(scanner.discoveredPeers.value.isEmpty())
+            assertEquals(listOf("BondedPeer"), scanner.discoveredPeers.value.map { it.nickname })
 
             gateway.emitDeviceFound(
                 AndroidDiscoveredDevice(
                     address = "11:22:33:44:55:66",
-                    name = "BluetoothSpeaker",
+                    name = "11-22-33-44-55-66",
                     uuids = listOf("0000110b-0000-1000-8000-00805f9b34fb"),
                 ),
             )
-            assertTrue(scanner.discoveredPeers.value.isEmpty())
+            gateway.emitDeviceUuidsFetched(
+                address = "11:22:33:44:55:66",
+                uuids = listOf("0000110b-0000-1000-8000-00805f9b34fb"),
+            )
+            assertEquals(listOf("BondedPeer"), scanner.discoveredPeers.value.map { it.nickname })
 
             gateway.emitDeviceUuidsFetched(
                 address = "aa:bb:cc:dd:ee:01",
@@ -181,7 +178,7 @@ class AndroidBluetoothTransportTest {
     }
 
     @Test
-    fun scannerMapsSecurityExceptionFailFastAndManagesAdvertisingSocketLifecycle() {
+    fun scannerMapsSecurityExceptionFailFastAndRequestsDiscoverableAdvertising() {
         runBlocking {
             val logger = RecordingAppLogger()
             val securityErrorGateway =
@@ -196,13 +193,7 @@ class AndroidBluetoothTransportTest {
             assertEquals(Manifest.permission.BLUETOOTH_SCAN, permissionError.permission)
             assertEquals(0, securityErrorGateway.activeReceiverCount)
 
-            val firstHandle = FakeServerSocketHandle()
-            val secondHandle = FakeServerSocketHandle()
-            val handleQueue = ArrayDeque(listOf(firstHandle, secondHandle))
-            val advertisingGateway =
-                FakeAndroidBluetoothGateway(
-                    serverSocketFactory = { _, _ -> handleQueue.removeFirst() },
-                )
+            val advertisingGateway = FakeAndroidBluetoothGateway()
             val scanner = createScanner(advertisingGateway, logger)
 
             val blankResult = scanner.startAdvertising("   ")
@@ -211,17 +202,109 @@ class AndroidBluetoothTransportTest {
 
             assertTrue(scanner.startAdvertising("PixelPhone").isSuccess)
             assertTrue(scanner.isAdvertising.value)
-            assertFalse(firstHandle.closed.get())
+            assertEquals(1, advertisingGateway.discoverableRequestCount)
 
             assertTrue(scanner.startAdvertising("PixelPhoneRenamed").isSuccess)
-            assertTrue(firstHandle.closed.get())
-            assertFalse(secondHandle.closed.get())
+            assertEquals(2, advertisingGateway.discoverableRequestCount)
 
             assertTrue(scanner.stopAdvertising().isSuccess)
             assertFalse(scanner.isAdvertising.value)
-            assertTrue(secondHandle.closed.get())
 
             scanner.close()
+        }
+    }
+
+    @Test
+    fun scannerRefreshesSdpForBondedDevicesWithCachedUuidsAndReceivesPostDiscoveryActionUuid() {
+        runBlocking {
+            val logger = RecordingAppLogger()
+            val bondedWithCachedUuid =
+                AndroidDiscoveredDevice(
+                    address = "44:55:66:77:88:99",
+                    name = "FedoraLaptop",
+                    uuids = listOf("0000110b-0000-1000-8000-00805f9b34fb"),
+                )
+            val gateway =
+                FakeAndroidBluetoothGateway(
+                    bondedDevices = listOf(bondedWithCachedUuid),
+                )
+            val scanner =
+                AndroidBluetoothScannerImpl(
+                    gateway = gateway,
+                    permissionChecker = AndroidBluetoothPermissionChecker(gateway, logger),
+                    dispatchers = dispatchers,
+                    logger = logger,
+                    clock = { Instant(1_700_000_000_123L) },
+                    postDiscoverySdpTimeoutMs = 5_000L,
+                )
+
+            assertTrue(scanner.startDiscovery().isSuccess)
+            assertEquals(listOf("44:55:66:77:88:99"), gateway.sdpFetchRequests.toList())
+            assertEquals(listOf("FedoraLaptop"), scanner.discoveredPeers.value.map { it.nickname })
+
+            gateway.emitDiscoveryFinished()
+            assertTrue(scanner.isScanning.value)
+            assertEquals(1, gateway.activeReceiverCount)
+
+            gateway.emitDeviceUuidsFetched(
+                address = "44:55:66:77:88:99",
+                uuids = listOf(TransportConstants.CANONICAL_SERVICE_UUID),
+            )
+            assertEquals(listOf("FedoraLaptop"), scanner.discoveredPeers.value.map { it.nickname })
+            assertFalse(scanner.isScanning.value)
+            assertEquals(0, gateway.activeReceiverCount)
+
+            scanner.close()
+        }
+    }
+
+    @Test
+    fun transportEmitsIncomingPeerConnectionWithRemoteMetadataAndDeliversEarlyPackets() {
+        runBlocking {
+            val logger = RecordingAppLogger()
+            val (clientChannel, serverChannel) = createLoopbackChannelPair(logger)
+            val serverHandle =
+                FakeServerSocketHandle(
+                    onAccept = { _, _ ->
+                        AcceptedAndroidConnection(
+                            channel = serverChannel,
+                            remoteAddress = "cc:dd:ee:ff:00:11",
+                            remoteName = "FedoraPeer",
+                        )
+                    },
+                )
+            val serverGateway = FakeAndroidBluetoothGateway(serverSocketFactory = { _, _ -> serverHandle })
+            val serverTransport = createTransport(serverGateway, logger)
+
+            val clientGateway =
+                FakeAndroidBluetoothGateway(
+                    grantedPermissions = setOf(Manifest.permission.BLUETOOTH_CONNECT),
+                    onConnectClient = { _, _, _, _ -> clientChannel },
+                )
+            val clientTransport = createTransport(clientGateway, logger)
+
+            try {
+                assertTrue(serverTransport.startServer().isSuccess)
+                awaitCondition { serverTransport.sessionState.value == SessionState.HANDSHAKING }
+
+                assertTrue(clientTransport.connect(BluetoothAddress("AA:BB:CC:DD:EE:FF")).isSuccess)
+                val earlyHandshake = HandshakePacket(step = 1, payload = byteArrayOf(11, 22, 33))
+                assertTrue(clientTransport.send(earlyHandshake).isSuccess)
+
+                val acceptedPeer = withTimeout(3_000L) { serverTransport.incomingConnections.first() }
+                assertEquals(
+                    IncomingPeerConnection(
+                        address = BluetoothAddress("CC:DD:EE:FF:00:11"),
+                        name = "FedoraPeer",
+                    ),
+                    acceptedPeer,
+                )
+                val receivedPacket = withTimeout(3_000L) { serverTransport.incomingPackets.first() }
+                assertEquals(earlyHandshake, receivedPacket)
+            } finally {
+                clientTransport.close()
+                serverTransport.close()
+            }
         }
     }
 
@@ -230,7 +313,16 @@ class AndroidBluetoothTransportTest {
         runBlocking {
             val logger = RecordingAppLogger()
             val (clientChannel, serverChannel) = createLoopbackChannelPair(logger)
-            val serverHandle = FakeServerSocketHandle(onAccept = { _, _ -> serverChannel })
+            val serverHandle =
+                FakeServerSocketHandle(
+                    onAccept = { _, _ ->
+                        AcceptedAndroidConnection(
+                            channel = serverChannel,
+                            remoteAddress = "BB:CC:DD:EE:FF:00",
+                            remoteName = "RemotePeer",
+                        )
+                    },
+                )
             val serverGateway = FakeAndroidBluetoothGateway(serverSocketFactory = { _, _ -> serverHandle })
             val serverTransport = createTransport(serverGateway, logger)
 
@@ -529,14 +621,14 @@ class AndroidBluetoothTransportTest {
     }
 
     private class FakeServerSocketHandle(
-        private val onAccept: ((CoroutineDispatchers, AppLogger) -> RfcommSocketChannel)? = null,
+        private val onAccept: ((CoroutineDispatchers, AppLogger) -> AcceptedAndroidConnection)? = null,
     ) : AndroidServerSocketHandle(null) {
         val closed: AtomicBoolean = AtomicBoolean(false)
 
         override fun accept(
             dispatchers: CoroutineDispatchers,
             logger: AppLogger,
-        ): RfcommSocketChannel =
+        ): AcceptedAndroidConnection =
             onAccept?.invoke(dispatchers, logger)
                 ?: throw IOException("No accept handler configured in test.")
 
@@ -563,6 +655,7 @@ class AndroidBluetoothTransportTest {
         var onStartDiscovery: (() -> Boolean)? = null
         var discoveryStarted: Boolean = false
         var cancelDiscoveryCalled: Boolean = false
+        var discoverableRequestCount: Int = 0
         val sdpFetchRequests: CopyOnWriteArrayList<String> = CopyOnWriteArrayList()
         var registeredReceiversCount: Int = 0
         var unregisteredReceiversCount: Int = 0
@@ -576,6 +669,10 @@ class AndroidBluetoothTransportTest {
         private var onDiscoveryFinishedHandler: (() -> Unit)? = null
 
         override fun hasPermission(permission: String): Boolean = permission in grantedPermissions
+
+        override fun requestDiscoverable() {
+            discoverableRequestCount += 1
+        }
 
         override fun isAdapterAvailable(): Boolean = adapterAvailable
 

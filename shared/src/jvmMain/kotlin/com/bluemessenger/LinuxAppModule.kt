@@ -22,6 +22,7 @@ import com.bluemessenger.domain.usecase.peer.DiscoverPeersUseCase
 import com.bluemessenger.domain.usecase.peer.InitializeIdentityUseCase
 import com.bluemessenger.domain.usecase.peer.ObserveConversationsUseCase
 import com.bluemessenger.domain.usecase.peer.VerifyPeerSafetyNumberUseCase
+import com.bluemessenger.domain.usecase.session.AcceptIncomingSessionsUseCase
 import com.bluemessenger.domain.usecase.session.EstablishSecureSessionUseCase
 import com.bluemessenger.domain.usecase.session.ManageKeepAliveAndReconnectUseCase
 import com.bluemessenger.logging.JvmAppLoggerImpl
@@ -135,6 +136,16 @@ class LinuxAppModule(
             bluetoothTransport = bluetoothTransport,
             cryptoService = cryptoService,
             peerRepository = peerRepository,
+            dispatchers = dispatchers,
+            logger = logger,
+            clock = clock,
+        )
+
+    val acceptIncomingSessionsUseCase: AcceptIncomingSessionsUseCase =
+        AcceptIncomingSessionsUseCase(
+            bluetoothTransport = bluetoothTransport,
+            peerRepository = peerRepository,
+            establishSecureSessionUseCase = establishSecureSessionUseCase,
             dispatchers = dispatchers,
             logger = logger,
             clock = clock,

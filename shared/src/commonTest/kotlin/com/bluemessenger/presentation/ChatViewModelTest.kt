@@ -10,11 +10,13 @@ import com.bluemessenger.domain.model.LocalIdentity
 import com.bluemessenger.domain.model.Message
 import com.bluemessenger.domain.model.Peer
 import com.bluemessenger.domain.ports.storage.IdentityRepository
+import com.bluemessenger.domain.ports.transport.model.IncomingPeerConnection
 import com.bluemessenger.domain.primitives.BluetoothAddress
 import com.bluemessenger.domain.primitives.ConversationId
 import com.bluemessenger.domain.primitives.Instant
 import com.bluemessenger.domain.primitives.MessageId
 import com.bluemessenger.domain.primitives.PeerId
+import com.bluemessenger.domain.usecase.FakeBluetoothScanner
 import com.bluemessenger.domain.usecase.InMemoryIdentityRepository
 import com.bluemessenger.domain.usecase.PeerSideFixture
 import com.bluemessenger.domain.usecase.createPeerSideFixture
@@ -22,13 +24,17 @@ import com.bluemessenger.domain.usecase.message.FlushPendingMessagesUseCase
 import com.bluemessenger.domain.usecase.message.ObserveIncomingFramesUseCase
 import com.bluemessenger.domain.usecase.message.ObserveMessagesUseCase
 import com.bluemessenger.domain.usecase.message.SendMessageUseCase
+import com.bluemessenger.domain.usecase.peer.DiscoverPeersUseCase
+import com.bluemessenger.domain.usecase.peer.InitializeIdentityUseCase
 import com.bluemessenger.domain.usecase.peer.ObserveConversationsUseCase
 import com.bluemessenger.domain.usecase.peer.VerifyPeerSafetyNumberUseCase
+import com.bluemessenger.domain.usecase.session.AcceptIncomingSessionsUseCase
 import com.bluemessenger.domain.usecase.session.ManageKeepAliveAndReconnectUseCase
 import com.bluemessenger.domain.usecase.testDispatchers
 import com.bluemessenger.presentation.chat.ChatIntent
 import com.bluemessenger.presentation.chat.ChatViewModel
 import com.bluemessenger.presentation.constants.PresentationConstants
+import com.bluemessenger.presentation.discovery.DiscoveryViewModel
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -283,6 +289,96 @@ class ChatViewModelTest {
             assertTrue(viewModel.uiState.value.messages.isEmpty())
         }
 
+    @Test
+    fun `responder discovery auto-starts server and chat viewmodel accepts incoming session and messages`() =
+        runTest {
+            val baseTimeMs = 1_700_000_000_000L
+            val clock: () -> Instant = { Instant(testScheduler.currentTime + baseTimeMs) }
+            val dispatchers = testDispatchers(testScheduler)
+            val alice = createPeerSideFixture(clock)
+            val bob = createPeerSideFixture(clock)
+            wireDuplex(alice, bob)
+
+            val alicePeer = peer("AliceDesktop", "AA:BB:CC:DD:EE:FF", clock())
+            val bobPeer = peer("BobAndroid", "11:22:33:44:55:66", Instant(clock().epochMillis + 1L))
+            val bobIdentityRepo = createInitializedIdentityRepo(bobPeer, bob, clock())
+            val bobAcceptUseCase =
+                AcceptIncomingSessionsUseCase(
+                    bob.transport,
+                    bob.peerRepo,
+                    bob.establish,
+                    dispatchers,
+                    bob.logger,
+                    clock,
+                )
+            val bobDiscoveryViewModel =
+                buildDiscoveryViewModel(bob, bobIdentityRepo, clock, bobAcceptUseCase)
+            val bobChatViewModel =
+                buildChatViewModel(bob, bobIdentityRepo, clock, acceptIncomingSessionsUseCase = bobAcceptUseCase)
+            runCurrent()
+
+            assertNotNull(bobDiscoveryViewModel.uiState.value.localIdentity)
+            assertEquals(1, bob.transport.startServerCount)
+            assertEquals(SessionState.ADVERTISING, bob.transport.sessionState.value)
+
+            alice.transport.onConnect = {
+                bob.transport.setSessionState(SessionState.HANDSHAKING)
+                bob.transport.emitIncomingConnection(IncomingPeerConnection(alicePeer.address, alicePeer.nickname))
+                bob.transport.awaitIncomingPacketSubscriber()
+                Result.success(Unit)
+            }
+
+            val aliceChatViewModel = buildChatViewModel(alice, InMemoryIdentityRepository(), clock)
+            aliceChatViewModel.onIntent(ChatIntent.OpenPeer(bobPeer))
+            aliceChatViewModel.onIntent(ChatIntent.Connect)
+            runCurrent()
+
+            assertEquals(SessionState.SECURE_ACTIVE, aliceChatViewModel.uiState.value.sessionState)
+            assertEquals(SessionState.SECURE_ACTIVE, bobChatViewModel.uiState.value.sessionState)
+            assertEquals(alicePeer.address, bobChatViewModel.uiState.value.peer?.address)
+
+            aliceChatViewModel.onIntent(ChatIntent.UpdateMessageInput("End to end across RFCOMM"))
+            aliceChatViewModel.onIntent(ChatIntent.SendMessage)
+            runCurrent()
+
+            assertEquals(MessageStatus.DELIVERED, aliceChatViewModel.uiState.value.messages.single().status)
+            assertEquals("End to end across RFCOMM", bobChatViewModel.uiState.value.messages.single().plaintext)
+            assertEquals(MessageDirection.INCOMING, bobChatViewModel.uiState.value.messages.single().direction)
+        }
+
+    private suspend fun createInitializedIdentityRepo(
+        peer: Peer,
+        side: PeerSideFixture,
+        now: Instant,
+    ): InMemoryIdentityRepository =
+        InMemoryIdentityRepository(
+            LocalIdentity(
+                id = peer.id,
+                nickname = peer.nickname,
+                identityPublicKey = side.keyStore.getIdentityPublicKey().getOrThrow()!!,
+                createdAt = now,
+            ),
+        )
+
+    private fun TestScope.buildDiscoveryViewModel(
+        side: PeerSideFixture,
+        identityRepo: IdentityRepository,
+        clock: () -> Instant,
+        acceptIncomingSessionsUseCase: AcceptIncomingSessionsUseCase,
+    ): DiscoveryViewModel {
+        val dispatchers = testDispatchers(testScheduler)
+        return DiscoveryViewModel(
+            initializeIdentityUseCase =
+                InitializeIdentityUseCase(identityRepo, side.keyStore, dispatchers, side.logger, clock),
+            discoverPeersUseCase = DiscoverPeersUseCase(FakeBluetoothScanner(), side.logger),
+            observeConversationsUseCase = ObserveConversationsUseCase(side.peerRepo, side.logger),
+            dispatchers = dispatchers,
+            logger = side.logger,
+            scope = backgroundScope,
+            acceptIncomingSessionsUseCase = acceptIncomingSessionsUseCase,
+        )
+    }
+
     private suspend fun TestScope.setupPairedViewModel(
         withQueuedOfflineMessage: Boolean,
         attachBobObserverOnAccept: Boolean = false,
@@ -415,6 +511,7 @@ class ChatViewModelTest {
         identityRepo: IdentityRepository,
         clock: () -> Instant,
         scope: CoroutineScope = backgroundScope,
+        acceptIncomingSessionsUseCase: AcceptIncomingSessionsUseCase? = null,
     ): ChatViewModel {
         val dispatchers = testDispatchers(testScheduler)
         val sendUseCase =
@@ -463,15 +560,11 @@ class ChatViewModelTest {
                     clock,
                 ),
             verifyPeerSafetyNumberUseCase =
-                VerifyPeerSafetyNumberUseCase(
-                    identityRepo,
-                    side.peerRepo,
-                    side.crypto,
-                    side.logger,
-                ),
+                VerifyPeerSafetyNumberUseCase(identityRepo, side.peerRepo, side.crypto, side.logger),
             dispatchers = dispatchers,
             logger = side.logger,
             scope = scope,
+            acceptIncomingSessionsUseCase = acceptIncomingSessionsUseCase,
         )
     }
 

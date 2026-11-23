@@ -61,15 +61,16 @@ class EstablishSecureSessionUseCase(
     ): Result<Conversation> =
         withContext(dispatchers.io) {
             val baseConversation = loadOrCreateConversation(peer).getOrElse { return@withContext Result.failure(it) }
+            val resolvedPeer = baseConversation.peer
             val connectingConv =
                 transitionToConnecting(baseConversation).getOrElse { return@withContext Result.failure(it) }
             if (!preserveReconnectingOnFailure) {
                 peerRepository.upsertConversation(connectingConv).getOrElse { return@withContext Result.failure(it) }
             }
 
-            bluetoothTransport.connect(peer.address).getOrElse { error ->
+            bluetoothTransport.connect(resolvedPeer.address).getOrElse { error ->
                 return@withContext cleanupAndFail(
-                    peerId = peer.id,
+                    peerId = resolvedPeer.id,
                     conversation = connectingConv,
                     preserveReconnectingOnFailure = preserveReconnectingOnFailure,
                     error = error,
@@ -80,7 +81,7 @@ class EstablishSecureSessionUseCase(
                 connectingConv.transitionSessionState(SessionState.HANDSHAKING, clock())
                     .getOrElse { error ->
                         return@withContext cleanupAndFail(
-                            peerId = peer.id,
+                            peerId = resolvedPeer.id,
                             conversation = connectingConv,
                             preserveReconnectingOnFailure = preserveReconnectingOnFailure,
                             error = error,
@@ -89,7 +90,7 @@ class EstablishSecureSessionUseCase(
             if (!preserveReconnectingOnFailure) {
                 peerRepository.upsertConversation(handshakingConv).getOrElse { error ->
                     return@withContext cleanupAndFail(
-                        peerId = peer.id,
+                        peerId = resolvedPeer.id,
                         conversation = handshakingConv,
                         preserveReconnectingOnFailure = preserveReconnectingOnFailure,
                         error = error,
@@ -97,7 +98,7 @@ class EstablishSecureSessionUseCase(
                 }
             }
 
-            runInitiatorHandshake(peer, handshakingConv, preserveReconnectingOnFailure)
+            runInitiatorHandshake(resolvedPeer, handshakingConv, preserveReconnectingOnFailure)
         }
 
     /**
@@ -106,6 +107,7 @@ class EstablishSecureSessionUseCase(
     suspend fun acceptAndEstablish(peer: Peer): Result<Conversation> =
         withContext(dispatchers.io) {
             val baseConversation = loadOrCreateConversation(peer).getOrElse { return@withContext Result.failure(it) }
+            val resolvedPeer = baseConversation.peer
             val connectingConv =
                 transitionToConnecting(baseConversation).getOrElse { return@withContext Result.failure(it) }
             peerRepository.upsertConversation(connectingConv).getOrElse { return@withContext Result.failure(it) }
@@ -114,7 +116,7 @@ class EstablishSecureSessionUseCase(
                 connectingConv.transitionSessionState(SessionState.HANDSHAKING, clock())
                     .getOrElse { error ->
                         return@withContext cleanupAndFail(
-                            peerId = peer.id,
+                            peerId = resolvedPeer.id,
                             conversation = connectingConv,
                             preserveReconnectingOnFailure = false,
                             error = error,
@@ -122,14 +124,14 @@ class EstablishSecureSessionUseCase(
                     }
             peerRepository.upsertConversation(handshakingConv).getOrElse { error ->
                 return@withContext cleanupAndFail(
-                    peerId = peer.id,
+                    peerId = resolvedPeer.id,
                     conversation = handshakingConv,
                     preserveReconnectingOnFailure = false,
                     error = error,
                 )
             }
 
-            runResponderHandshake(peer, handshakingConv)
+            runResponderHandshake(resolvedPeer, handshakingConv)
         }
 
     /**
@@ -453,42 +455,82 @@ class EstablishSecureSessionUseCase(
         return peerRepository.getConversationByPeer(peer.id).fold(
             onSuccess = { existingConversation ->
                 if (existingConversation != null) {
-                    Result.success(
-                        existingConversation.copy(
-                            peer =
-                                existingConversation.peer.copy(
-                                    nickname = peer.nickname,
-                                    address = peer.address,
-                                    lastSeenAt = now,
-                                ),
-                        ),
-                    )
+                    Result.success(mergeConversationPeer(existingConversation, peer, now))
                 } else {
-                    loadPeerOrCreateConversation(peer, now)
+                    loadPeerByAddressOrCreateConversation(peer, now)
                 }
             },
             onFailure = { Result.failure(it) },
         )
     }
 
-    private suspend fun loadPeerOrCreateConversation(
+    private suspend fun loadPeerByAddressOrCreateConversation(
         incomingPeer: Peer,
         now: Instant,
     ): Result<Conversation> =
-        peerRepository.getPeerById(incomingPeer.id).map { persistedPeer ->
-            val mergedPeer =
-                persistedPeer?.copy(
-                    nickname = incomingPeer.nickname,
-                    address = incomingPeer.address,
-                    lastSeenAt = now,
-                ) ?: incomingPeer.copy(lastSeenAt = now)
-            Conversation(
-                id = ConversationId.generate(now),
-                peer = mergedPeer,
-                state = SessionState.DISCONNECTED,
-                updatedAt = now,
-            )
+        resolvePersistedPeer(incomingPeer).fold(
+            onSuccess = { persistedPeer ->
+                resolveConversationForPersistedPeer(persistedPeer, incomingPeer, now)
+            },
+            onFailure = { Result.failure(it) },
+        )
+
+    private suspend fun resolvePersistedPeer(incomingPeer: Peer): Result<Peer?> =
+        peerRepository.getPeerById(incomingPeer.id).fold(
+            onSuccess = { persistedById ->
+                if (persistedById != null) {
+                    Result.success(persistedById)
+                } else {
+                    peerRepository.getPeerByAddress(incomingPeer.address)
+                }
+            },
+            onFailure = { Result.failure(it) },
+        )
+
+    private suspend fun resolveConversationForPersistedPeer(
+        persistedPeer: Peer?,
+        incomingPeer: Peer,
+        now: Instant,
+    ): Result<Conversation> {
+        val existingResult =
+            if (persistedPeer != null) {
+                peerRepository.getConversationByPeer(persistedPeer.id)
+            } else {
+                Result.success(null)
+            }
+        return existingResult.map { existingForAddress ->
+            if (existingForAddress != null) {
+                mergeConversationPeer(existingForAddress, incomingPeer, now)
+            } else {
+                val mergedPeer =
+                    persistedPeer?.copy(
+                        nickname = incomingPeer.nickname,
+                        address = incomingPeer.address,
+                        lastSeenAt = now,
+                    ) ?: incomingPeer.copy(lastSeenAt = now)
+                Conversation(
+                    id = ConversationId.generate(now),
+                    peer = mergedPeer,
+                    state = SessionState.DISCONNECTED,
+                    updatedAt = now,
+                )
+            }
         }
+    }
+
+    private fun mergeConversationPeer(
+        existing: Conversation,
+        incoming: Peer,
+        now: Instant,
+    ): Conversation =
+        existing.copy(
+            peer =
+                existing.peer.copy(
+                    nickname = incoming.nickname,
+                    address = incoming.address,
+                    lastSeenAt = now,
+                ),
+        )
 
     private fun transitionToConnecting(conversation: Conversation): Result<Conversation> {
         val now = clock()

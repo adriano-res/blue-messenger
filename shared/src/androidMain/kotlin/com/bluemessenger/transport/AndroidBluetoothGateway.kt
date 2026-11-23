@@ -15,8 +15,10 @@ import android.os.Build
 import android.os.ParcelUuid
 import com.bluemessenger.domain.concurrency.CoroutineDispatchers
 import com.bluemessenger.domain.ports.logging.AppLogger
+import com.bluemessenger.transport.constants.AndroidTransportConstants
 import java.io.Closeable
 import java.io.IOException
+import java.lang.reflect.InvocationTargetException
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -28,6 +30,15 @@ internal data class AndroidDiscoveredDevice(
     val address: String,
     val name: String?,
     val uuids: List<String>,
+)
+
+/**
+ * Result of accepting an incoming insecure RFCOMM client socket along with resolved peer metadata.
+ */
+internal data class AcceptedAndroidConnection(
+    val channel: RfcommSocketChannel,
+    val remoteAddress: String?,
+    val remoteName: String?,
 )
 
 /**
@@ -43,18 +54,33 @@ internal open class AndroidServerSocketHandle(
     private val closed: AtomicBoolean = AtomicBoolean(false)
 
     /**
-     * Blocks until a remote peer connects and returns a framed [RfcommSocketChannel] backed by
-     * the accepted [BluetoothSocket] streams.
+     * Blocks until a remote peer connects and returns an [AcceptedAndroidConnection] wrapping a
+     * framed [RfcommSocketChannel] and the remote Bluetooth address/name when available.
      */
     @Throws(IOException::class)
     open fun accept(
         dispatchers: CoroutineDispatchers,
         logger: AppLogger,
-    ): RfcommSocketChannel {
+    ): AcceptedAndroidConnection {
         val server = checkNotNull(serverSocket) { "BluetoothServerSocket is not initialized." }
         val clientSocket = server.accept()
-        return openChannelFromSocket(clientSocket, dispatchers, logger)
+        val remoteAddress = clientSocket.remoteDevice?.address
+        val remoteName = extractRemoteDeviceName(clientSocket)
+        val channel = openChannelFromSocket(clientSocket, dispatchers, logger)
+        return AcceptedAndroidConnection(
+            channel = channel,
+            remoteAddress = remoteAddress,
+            remoteName = remoteName,
+        )
     }
+
+    @SuppressLint("MissingPermission")
+    private fun extractRemoteDeviceName(clientSocket: BluetoothSocket): String? =
+        try {
+            clientSocket.remoteDevice?.name
+        } catch (_: SecurityException) {
+            null
+        }
 
     /**
      * Closes the underlying [BluetoothServerSocket] idempotently.
@@ -81,17 +107,30 @@ internal open class AndroidServerSocketHandle(
  */
 internal open class AndroidBluetoothGateway private constructor(
     private val applicationContext: Context?,
+    private val onDiscoverableRequested: (() -> Unit)?,
     @Suppress("UNUSED_PARAMETER") unusedMarker: Boolean,
 ) {
-    constructor(context: Context) : this(
+    constructor(
+        context: Context,
+        onDiscoverableRequested: (() -> Unit)? = null,
+    ) : this(
         applicationContext = context.applicationContext,
+        onDiscoverableRequested = onDiscoverableRequested,
         unusedMarker = false,
     )
 
     protected constructor() : this(
         applicationContext = null,
+        onDiscoverableRequested = null,
         unusedMarker = true,
     )
+
+    /**
+     * Triggers the platform discoverability prompt if an entrypoint callback is registered.
+     */
+    open fun requestDiscoverable() {
+        onDiscoverableRequested?.invoke()
+    }
 
     /**
      * Returns whether [permission] is currently granted to the application process.
@@ -209,18 +248,88 @@ internal open class AndroidBluetoothGateway private constructor(
     ): RfcommSocketChannel {
         val parsedUuid = UUID.fromString(serviceUuid)
         val device = requireAdapter().getRemoteDevice(address)
-        val socket = device.createInsecureRfcommSocketToServiceRecord(parsedUuid)
-        return try {
-            socket.connect()
-            openChannelFromSocket(socket, dispatchers, logger)
-        } catch (exception: IOException) {
-            closeSocketQuietly(socket)
-            throw exception
-        } catch (exception: SecurityException) {
-            closeSocketQuietly(socket)
-            throw exception
+        val isBonded = device.bondState == BluetoothDevice.BOND_BONDED
+        val factories = buildClientSocketFactories(device, parsedUuid, isBonded, logger)
+        var lastException: IOException? = null
+        for (factory in factories) {
+            val socket = factory() ?: continue
+            try {
+                socket.connect()
+                return openChannelFromSocket(socket, dispatchers, logger)
+            } catch (exception: IOException) {
+                closeSocketQuietly(socket)
+                lastException = exception
+                logger.debug(
+                    tag = AndroidTransportConstants.TAG_TRANSPORT,
+                    message = "Android RFCOMM socket connection attempt failed; trying next fallback.",
+                    context = mapOf("address" to address, "reason" to (exception.message ?: "io_error")),
+                )
+            } catch (exception: SecurityException) {
+                closeSocketQuietly(socket)
+                throw exception
+            }
         }
+        throw lastException ?: IOException("Unable to open Android RFCOMM client socket to $address.")
     }
+
+    @SuppressLint("MissingPermission")
+    private fun buildClientSocketFactories(
+        device: BluetoothDevice,
+        serviceUuid: UUID,
+        isBonded: Boolean,
+        logger: AppLogger,
+    ): List<() -> BluetoothSocket?> =
+        buildList {
+            add { device.createInsecureRfcommSocketToServiceRecord(serviceUuid) }
+            if (isBonded) {
+                add { device.createRfcommSocketToServiceRecord(serviceUuid) }
+            }
+            add {
+                createChannelRfcommSocketOrNull(
+                    device = device,
+                    channel = AndroidTransportConstants.RFCOMM_FALLBACK_CHANNEL,
+                    methodName = AndroidTransportConstants.METHOD_CREATE_INSECURE_RFCOMM_SOCKET,
+                    logger = logger,
+                )
+            }
+            if (isBonded) {
+                add {
+                    createChannelRfcommSocketOrNull(
+                        device = device,
+                        channel = AndroidTransportConstants.RFCOMM_FALLBACK_CHANNEL,
+                        methodName = AndroidTransportConstants.METHOD_CREATE_RFCOMM_SOCKET,
+                        logger = logger,
+                    )
+                }
+            }
+        }
+
+    private fun createChannelRfcommSocketOrNull(
+        device: BluetoothDevice,
+        channel: Int,
+        methodName: String,
+        logger: AppLogger,
+    ): BluetoothSocket? =
+        try {
+            val method = device.javaClass.getMethod(methodName, Int::class.javaPrimitiveType)
+            method.invoke(device, channel) as? BluetoothSocket
+        } catch (_: NoSuchMethodException) {
+            null
+        } catch (_: IllegalAccessException) {
+            null
+        } catch (exception: InvocationTargetException) {
+            val target = exception.targetException
+            if (target is SecurityException) {
+                throw SecurityException(target.message, exception)
+            }
+            val reason = target?.message ?: exception.message ?: "invocation_error"
+            logger.debug(
+                tag = AndroidTransportConstants.TAG_TRANSPORT,
+                message = "Channel RFCOMM socket reflection invocation failed.",
+                context = mapOf("method" to methodName, "reason" to reason),
+            )
+            null
+        }
 
     private fun resolveAdapterOrNull(): BluetoothAdapter? {
         val ctx = applicationContext ?: return null
